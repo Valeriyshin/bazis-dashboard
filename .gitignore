@@ -1,0 +1,9 @@
+node_modules/
+.next/
+.env.local
+.env*.local
+dev.log
+data/app.db
+data/app.db-*
+data/refresh.log
+next-env.d.ts

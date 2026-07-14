@@ -7,3 +7,8 @@ data/app.db
 data/app.db-*
 data/refresh.log
 next-env.d.ts
+
+.vercel
+data/*.json
+data/*.html
+data/*.csv

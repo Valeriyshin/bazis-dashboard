@@ -104,7 +104,7 @@ function buildSummary(daily, campaigns, results, since, until) {
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, account_name TEXT, created_at TEXT, period_start TEXT, period_end TEXT, currency TEXT DEFAULT 'USD')`,
-  `CREATE TABLE IF NOT EXISTS daily_insights (snapshot_id INTEGER, date TEXT, spend REAL, impressions INTEGER, reach INTEGER, frequency REAL, clicks INTEGER, cpc REAL, cpm REAL, cpp REAL, ctr REAL, page_engagement INTEGER, link_click INTEGER, PRIMARY KEY (snapshot_id, date))`,
+  `CREATE TABLE IF NOT EXISTS daily_insights (snapshot_id INTEGER, date TEXT, spend REAL, impressions INTEGER, reach INTEGER, frequency REAL, clicks INTEGER, cpc REAL, cpm REAL, cpp REAL, ctr REAL, page_engagement INTEGER, link_click INTEGER, leads INTEGER, PRIMARY KEY (snapshot_id, date))`,
   `CREATE TABLE IF NOT EXISTS campaign_insights (snapshot_id INTEGER, campaign_id TEXT, name TEXT, objective TEXT, status TEXT, spend REAL, impressions INTEGER, reach INTEGER, frequency REAL, clicks INTEGER, cpc REAL, cpm REAL, ctr REAL, page_engagement INTEGER, link_click INTEGER, results REAL, result_type TEXT, cost_per_result REAL, PRIMARY KEY (snapshot_id, campaign_id))`,
   `CREATE TABLE IF NOT EXISTS adset_insights (snapshot_id INTEGER, adset_id TEXT, campaign_id TEXT, name TEXT, status TEXT, spend REAL, impressions INTEGER, reach INTEGER, frequency REAL, clicks INTEGER, cpc REAL, cpm REAL, ctr REAL, page_engagement INTEGER, link_click INTEGER, results REAL, result_type TEXT, cost_per_result REAL, PRIMARY KEY (snapshot_id, adset_id))`,
   `CREATE TABLE IF NOT EXISTS ad_insights (snapshot_id INTEGER, ad_id TEXT, campaign_id TEXT, adset_id TEXT, name TEXT, status TEXT, spend REAL, impressions INTEGER, reach INTEGER, frequency REAL, clicks INTEGER, cpc REAL, cpm REAL, ctr REAL, page_engagement INTEGER, link_click INTEGER, results REAL, result_type TEXT, cost_per_result REAL, PRIMARY KEY (snapshot_id, ad_id))`,
@@ -144,7 +144,8 @@ export async function runSync(opts = {}) {
     statusMap("campaigns"), statusMap("adsets"), statusMap("ads"),
   ]);
 
-  const dailyRows = daily.map((r) => ({ date: r.date_start, ...base(r), cpp: num(r.cpp) }));
+  // leads на уровне аккаунта по дням — берём из actions (нужно для KPI «Лиды/CPL» в Обзоре).
+  const dailyRows = daily.map((r) => ({ date: r.date_start, ...base(r), cpp: num(r.cpp), leads: leadsFrom(r.actions) }));
   const results = {};
   const campRows = camps.map((r) => { const ri = resultInfo(r); results[r.campaign_id] = ri; return { id: r.campaign_id, name: r.campaign_name, objective: r.objective || "", status: campStatus[r.campaign_id] ?? "PAUSED", ...base(r), ...ri }; });
   const adsetRows = adsets.map((r) => ({ id: r.adset_id, campaign_id: r.campaign_id, name: r.adset_name, status: adsetStatus[r.adset_id] ?? "PAUSED", ...base(r), ...resultInfo(r) }));
@@ -153,6 +154,8 @@ export async function runSync(opts = {}) {
 
   const db = client();
   await db.batch(SCHEMA, "write");
+  // Миграция для уже созданных БД: добавить колонку leads, если её ещё нет.
+  try { await db.execute("ALTER TABLE daily_insights ADD COLUMN leads INTEGER"); } catch { /* уже есть */ }
 
   const now = new Date().toISOString();
   const snapRes = await db.execute({
@@ -162,7 +165,7 @@ export async function runSync(opts = {}) {
   const snapId = Number(snapRes.lastInsertRowid);
 
   const stmts = [];
-  for (const r of dailyRows) stmts.push({ sql: "INSERT INTO daily_insights (snapshot_id,date,spend,impressions,reach,frequency,clicks,cpc,cpm,cpp,ctr,page_engagement,link_click) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.date, r.spend, r.impressions, r.reach, r.frequency, r.clicks, r.cpc, r.cpm, r.cpp, r.ctr, r.page_engagement, r.link_click] });
+  for (const r of dailyRows) stmts.push({ sql: "INSERT INTO daily_insights (snapshot_id,date,spend,impressions,reach,frequency,clicks,cpc,cpm,cpp,ctr,page_engagement,link_click,leads) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.date, r.spend, r.impressions, r.reach, r.frequency, r.clicks, r.cpc, r.cpm, r.cpp, r.ctr, r.page_engagement, r.link_click, r.leads] });
   for (const r of campRows) stmts.push({ sql: "INSERT INTO campaign_insights (snapshot_id,campaign_id,name,objective,status,spend,impressions,reach,frequency,clicks,cpc,cpm,ctr,page_engagement,link_click,results,result_type,cost_per_result) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.name, r.objective, r.status, r.spend, r.impressions, r.reach, r.frequency, r.clicks, r.cpc, r.cpm, r.ctr, r.page_engagement, r.link_click, r.results, r.result_type, r.cost_per_result] });
   for (const r of adsetRows) stmts.push({ sql: "INSERT INTO adset_insights (snapshot_id,adset_id,campaign_id,name,status,spend,impressions,reach,frequency,clicks,cpc,cpm,ctr,page_engagement,link_click,results,result_type,cost_per_result) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.campaign_id, r.name, r.status, r.spend, r.impressions, r.reach, r.frequency, r.clicks, r.cpc, r.cpm, r.ctr, r.page_engagement, r.link_click, r.results, r.result_type, r.cost_per_result] });
   for (const r of adRows) stmts.push({ sql: "INSERT INTO ad_insights (snapshot_id,ad_id,campaign_id,adset_id,name,status,spend,impressions,reach,frequency,clicks,cpc,cpm,ctr,page_engagement,link_click,results,result_type,cost_per_result) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.campaign_id, r.adset_id, r.name, r.status, r.spend, r.impressions, r.reach, r.frequency, r.clicks, r.cpc, r.cpm, r.ctr, r.page_engagement, r.link_click, r.results, r.result_type, r.cost_per_result] });

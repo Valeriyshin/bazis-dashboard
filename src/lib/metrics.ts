@@ -22,11 +22,21 @@ export interface Totals {
   clicks: number;
   page_engagement: number;
   link_click: number;
+  leads: number;
   days: number;
 }
 
 export const METRICS: MetricDef[] = [
   { key: "spend", label: "Расход", unit: "currency", kind: "sum", goodDirection: "neutral" },
+  { key: "leads", label: "Лиды", unit: "number", kind: "sum", goodDirection: "up" },
+  {
+    key: "cpl",
+    label: "CPL (цена лида)",
+    unit: "currency",
+    kind: "ratio",
+    goodDirection: "down",
+    derive: (a) => (a.leads ? a.spend / a.leads : 0),
+  },
   { key: "impressions", label: "Показы", unit: "number", kind: "sum", goodDirection: "up" },
   { key: "reach", label: "Охват", unit: "number", kind: "sum", goodDirection: "up" },
   { key: "clicks", label: "Клики", unit: "number", kind: "sum", goodDirection: "up" },
@@ -78,7 +88,7 @@ export const METRIC_BY_KEY: Record<string, MetricDef> = Object.fromEntries(
   METRICS.map((m) => [m.key, m])
 );
 
-export const DEFAULT_KPI_KEYS = ["spend", "impressions", "reach", "clicks", "ctr", "cpc", "cpm", "frequency"];
+export const DEFAULT_KPI_KEYS = ["spend", "leads", "cpl", "impressions", "reach", "clicks", "ctr", "cpc", "cpm", "frequency"];
 
 export interface DailyRow {
   date: string;
@@ -93,10 +103,11 @@ export interface DailyRow {
   ctr: number;
   page_engagement: number;
   link_click: number;
+  leads: number;
 }
 
 export function emptyTotals(): Totals {
-  return { spend: 0, impressions: 0, reach: 0, clicks: 0, page_engagement: 0, link_click: 0, days: 0 };
+  return { spend: 0, impressions: 0, reach: 0, clicks: 0, page_engagement: 0, link_click: 0, leads: 0, days: 0 };
 }
 
 export function sumRows(rows: DailyRow[]): Totals {
@@ -108,6 +119,7 @@ export function sumRows(rows: DailyRow[]): Totals {
     t.clicks += r.clicks;
     t.page_engagement += r.page_engagement;
     t.link_click += r.link_click;
+    t.leads += r.leads ?? 0;
     t.days += 1;
   }
   return t;

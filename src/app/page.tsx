@@ -85,11 +85,29 @@ function domType(ts: Record<string, number>): string {
   return e ? e[0] : "—";
 }
 
+const money0 = (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
+const int0 = (n: number) => Math.round(n).toLocaleString("ru-RU");
+// Столбцы сводки по ЖК. get(agg) → число; fmt форматирует. type — особый (не число).
+const ZHK_COLS = [
+  { key: "type", label: "Тип кампании", type: true },
+  { key: "impressions", label: "Показы", get: (a: ZhkAgg) => a.impressions, fmt: int0 },
+  { key: "reach", label: "Охват", get: (a: ZhkAgg) => a.reach, fmt: (n: number) => (n ? int0(n) : "—") },
+  { key: "clicks", label: "Клики", get: (a: ZhkAgg) => a.clicks, fmt: int0 },
+  { key: "ctr", label: "CTR", get: (a: ZhkAgg) => (a.impressions ? (a.clicks / a.impressions) * 100 : 0), fmt: (n: number) => (n ? n.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—") },
+  { key: "leads", label: "Кол-во лидов", get: (a: ZhkAgg) => a.leads, fmt: int0 },
+  { key: "cpl", label: "Цена лида", get: (a: ZhkAgg) => (a.leads ? a.spend / a.leads : 0), fmt: (n: number) => (n ? "$" + n.toFixed(2) : "—") },
+  { key: "spend", label: "Расход", get: (a: ZhkAgg) => a.spend, fmt: money0 },
+] as const;
+const ZHK_DEFAULT = ["type", "impressions", "reach", "clicks", "ctr", "leads", "cpl", "spend"];
+
 function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   const [google, setGoogle] = useState<GCampaign[] | null>(null);
+  const [cols, setCols] = useState<string[]>(ZHK_DEFAULT);
   useEffect(() => {
     fetch("/api/google").then((r) => r.json()).then((d) => setGoogle(d.error ? [] : d.campaigns)).catch(() => setGoogle([]));
   }, []);
+  const active = ZHK_COLS.filter((c) => cols.includes(c.key));
+  const toggle = (k: string) => setCols(cols.includes(k) ? cols.filter((x) => x !== k) : [...cols, k]);
 
   // group[ЖК][система] = ZhkAgg
   const group: Record<string, Record<string, ZhkAgg>> = {};
@@ -114,17 +132,13 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
     });
   }
 
-  const money = (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
-  const int = (n: number) => Math.round(n).toLocaleString("ru-RU");
-  const ctr = (a: ZhkAgg) => (a.impressions ? ((a.clicks / a.impressions) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—");
   const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", TikTok: "⚫" };
+  const cell = (c: (typeof ZHK_COLS)[number], a: ZhkAgg, isType: boolean) =>
+    "type" in c && c.type ? (isType ? domType(a.typeSpend) : "—") : (c as { get: (a: ZhkAgg) => number; fmt: (n: number) => string }).fmt((c as { get: (a: ZhkAgg) => number }).get(a));
 
   // ЖК по убыванию суммарного расхода
-  const zhks = Object.keys(group).sort((x, y) => {
-    const sx = Object.values(group[y]).reduce((s, a) => s + a.spend, 0);
-    const sy = Object.values(group[x]).reduce((s, a) => s + a.spend, 0);
-    return sx - sy;
-  });
+  const zhks = Object.keys(group).sort((x, y) =>
+    Object.values(group[y]).reduce((s, a) => s + a.spend, 0) - Object.values(group[x]).reduce((s, a) => s + a.spend, 0));
 
   const grand = newAgg();
   const rows: React.ReactNode[] = [];
@@ -137,23 +151,16 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
       rows.push(
         <tr key={zhk + sys}>
           <td>{zhk}</td>
-          <td>{SYS_ICON[sys] ?? ""} {sys}</td>
-          <td>{domType(a.typeSpend)}</td>
-          <td>{int(a.impressions)}</td>
-          <td>{a.reach ? int(a.reach) : "—"}</td>
-          <td>{int(a.clicks)}</td>
-          <td>{ctr(a)}</td>
-          <td>{int(a.leads)}</td>
-          <td>{money(a.spend)}</td>
+          <td style={{ whiteSpace: "nowrap" }}>{SYS_ICON[sys] ?? ""} {sys}</td>
+          {active.map((c) => <td key={c.key}>{cell(c, a, true)}</td>)}
         </tr>
       );
     }
     grand.impressions += sub.impressions; grand.reach += sub.reach; grand.clicks += sub.clicks; grand.leads += sub.leads; grand.spend += sub.spend;
     rows.push(
       <tr key={zhk + "_total"} style={{ fontWeight: 700, background: "var(--panel-2)" }}>
-        <td>Итого {zhk}</td><td>—</td><td>—</td>
-        <td>{int(sub.impressions)}</td><td>{sub.reach ? int(sub.reach) : "—"}</td><td>{int(sub.clicks)}</td>
-        <td>{ctr(sub)}</td><td>{int(sub.leads)}</td><td>{money(sub.spend)}</td>
+        <td>Итого {zhk}</td><td>—</td>
+        {active.map((c) => <td key={c.key}>{cell(c, sub, false)}</td>)}
       </tr>
     );
   }
@@ -161,18 +168,25 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   return (
     <div className="panel">
       <div className="panel-title">Сводные данные по всем ЖК за период {google === null && <span className="muted">(загрузка Google…)</span>}</div>
+      <div style={{ marginBottom: 14 }}>
+        <div className="panel-title" style={{ fontSize: 13 }}>Столбцы</div>
+        <div className="chips">
+          {ZHK_COLS.map((c) => (
+            <div key={c.key} className={"chip" + (cols.includes(c.key) ? " on" : "")} onClick={() => toggle(c.key)}>{c.label}</div>
+          ))}
+        </div>
+      </div>
       <div className="table-scroll">
         <table>
           <thead><tr>
-            <th>ЖК</th><th>Система</th><th>Тип кампании</th><th>Показы</th><th>Охват</th><th>Клики</th><th>CTR</th><th>Кол-во лидов</th><th>Расход</th>
+            <th>ЖК</th><th>Система</th>
+            {active.map((c) => <th key={c.key}>{c.label}</th>)}
           </tr></thead>
           <tbody>
             {rows}
             <tr style={{ fontWeight: 700, borderTop: "2px solid var(--accent)" }}>
-              <td colSpan={3}>Общий итог</td>
-              <td>{int(grand.impressions)}</td><td>{int(grand.reach)}</td><td>{int(grand.clicks)}</td>
-              <td>{grand.impressions ? ((grand.clicks / grand.impressions) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
-              <td>{int(grand.leads)}</td><td>{money(grand.spend)}</td>
+              <td>Общий итог</td><td>—</td>
+              {active.map((c) => <td key={c.key}>{cell(c, grand, false)}</td>)}
             </tr>
           </tbody>
         </table>

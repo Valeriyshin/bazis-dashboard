@@ -105,8 +105,16 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   useEffect(() => {
     fetch("/api/google").then((r) => r.json()).then((d) => setGoogle(d.error ? [] : d.campaigns)).catch(() => setGoogle([]));
   }, []);
+  const [sortKey, setSortKey] = useState<string>("spend");
+  const [asc, setAsc] = useState(false);
   const active = ZHK_COLS.filter((c) => cols.includes(c.key));
   const toggle = (k: string) => setCols(cols.includes(k) ? cols.filter((x) => x !== k) : [...cols, k]);
+  const setSort = (k: string) => { if (k === sortKey) setAsc(!asc); else { setSortKey(k); setAsc(false); } };
+  // Числовое значение столбца по агрегату (для сортировки ЖК).
+  const colVal = (key: string, a: ZhkAgg) => {
+    const c = ZHK_COLS.find((x) => x.key === key) as { get?: (a: ZhkAgg) => number } | undefined;
+    return c?.get ? c.get(a) : a.spend;
+  };
 
   // group[ЖК][система] = ZhkAgg
   const group: Record<string, Record<string, ZhkAgg>> = {};
@@ -135,9 +143,17 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   const cell = (c: (typeof ZHK_COLS)[number], a: ZhkAgg, isType: boolean) =>
     "type" in c && c.type ? (isType ? domType(a.typeSpend) : "—") : (c as { get: (a: ZhkAgg) => number; fmt: (n: number) => string }).fmt((c as { get: (a: ZhkAgg) => number }).get(a));
 
-  // ЖК по убыванию суммарного расхода
-  const zhks = Object.keys(group).sort((x, y) =>
-    Object.values(group[y]).reduce((s, a) => s + a.spend, 0) - Object.values(group[x]).reduce((s, a) => s + a.spend, 0));
+  // Итог по каждому ЖК (для сортировки).
+  const zhkTotal: Record<string, ZhkAgg> = {};
+  for (const zhk of Object.keys(group)) {
+    const t = newAgg();
+    for (const a of Object.values(group[zhk])) { t.impressions += a.impressions; t.reach += a.reach; t.clicks += a.clicks; t.leads += a.leads; t.spend += a.spend; }
+    zhkTotal[zhk] = t;
+  }
+  const zhks = Object.keys(group).sort((x, y) => {
+    const d = colVal(sortKey, zhkTotal[x]) - colVal(sortKey, zhkTotal[y]);
+    return asc ? d : -d;
+  });
 
   const grand = newAgg();
   const rows: React.ReactNode[] = [];
@@ -179,7 +195,11 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
         <table>
           <thead><tr>
             <th>ЖК</th><th>Система</th>
-            {active.map((c) => <th key={c.key}>{c.label}</th>)}
+            {active.map((c) => (
+              <th key={c.key} onClick={() => setSort(c.key)} style={{ cursor: "pointer" }}>
+                {c.label}{sortKey === c.key ? (asc ? " ▲" : " ▼") : ""}
+              </th>
+            ))}
           </tr></thead>
           <tbody>
             {rows}
@@ -214,6 +234,7 @@ function GoogleAds() {
   const [metric, setMetric] = useState<"spend" | "clicks" | "conversions" | "impressions">("spend");
   const [sortKey, setSortKey] = useState<keyof GCampaign>("spend");
   const [asc, setAsc] = useState(false);
+  const [cols, setCols] = useState<string[]>(["spend", "conversions", "cost_per_conversion", "clicks", "ctr", "cpc", "impressions"]);
 
   useEffect(() => {
     fetch("/api/google").then((r) => r.json()).then((d) => { d.error ? setErr(d.error) : setG(d); }).catch((e) => setErr(String(e)));
@@ -255,6 +276,8 @@ function GoogleAds() {
     { k: "ctr", l: "CTR", f: (n) => n.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" },
     { k: "cpc", l: "CPC", f: money }, { k: "impressions", l: "Показы", f: int },
   ];
+  const activeCols = COLS.filter((c) => cols.includes(c.k));
+  const toggleCol = (k: string) => setCols(cols.includes(k) ? cols.filter((x) => x !== k) : [...cols, k]);
 
   return (
     <>
@@ -285,20 +308,29 @@ function GoogleAds() {
       </div>
 
       <div className="panel">
+        <div className="panel-title" style={{ fontSize: 13 }}>Столбцы</div>
+        <div className="chips">
+          {COLS.map((c) => (
+            <div key={c.k} className={"chip" + (cols.includes(c.k) ? " on" : "")} onClick={() => toggleCol(c.k)}>{c.l}</div>
+          ))}
+        </div>
+      </div>
+
+      <div className="panel">
         <div className="panel-title">Кампании Google Ads ({g.campaigns.length})</div>
         <div className="table-scroll">
           <table>
             <thead><tr>
               <th onClick={() => setSort("name")}>Кампания</th>
               <th onClick={() => setSort("status")}>Статус</th>
-              {COLS.map((c) => <th key={c.k} onClick={() => setSort(c.k)}>{c.l}{sortKey === c.k ? (asc ? " ▲" : " ▼") : ""}</th>)}
+              {activeCols.map((c) => <th key={c.k} onClick={() => setSort(c.k)} style={{ cursor: "pointer" }}>{c.l}{sortKey === c.k ? (asc ? " ▲" : " ▼") : ""}</th>)}
             </tr></thead>
             <tbody>
               {sorted.map((c) => (
                 <tr key={c.campaign_id}>
                   <td title={c.name} style={{ maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</td>
                   <td><span className={"badge " + (c.status === "ACTIVE" ? "active" : "paused")}>{c.status === "ACTIVE" ? "Активна" : "Пауза"}</span></td>
-                  {COLS.map((col) => <td key={col.k}>{col.f(c[col.k] as number)}</td>)}
+                  {activeCols.map((col) => <td key={col.k}>{col.f(c[col.k] as number)}</td>)}
                 </tr>
               ))}
             </tbody>

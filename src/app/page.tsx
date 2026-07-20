@@ -24,7 +24,7 @@ interface ApiData {
   summary: { author: string; created_at: string; data: SummaryData | null } | null;
 }
 
-const TABS = ["Обзор", "Динамика", "Кампании", "Сводка", "Google Ads"] as const;
+const TABS = ["Обзор", "Meta", "Сводка", "Google Ads"] as const;
 type Tab = (typeof TABS)[number];
 const LINE_COLORS = ["#4f8cff", "#34d399", "#f59e0b", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#facc15", "#60a5fa", "#4ade80", "#fb923c"];
 
@@ -65,8 +65,7 @@ export default function Page() {
       </div>
 
       {tab === "Обзор" && <><OverviewCompare daily={data.daily} /><ZhkSummary metaCampaigns={data.campaigns} /></>}
-      {tab === "Динамика" && <Dynamics daily={data.daily} />}
-      {tab === "Кампании" && <Breakdown campaigns={data.campaigns} adsets={data.adsets} ads={data.ads} snapshot={data.snapshot} />}
+      {tab === "Meta" && <><Dynamics daily={data.daily} /><Breakdown campaigns={data.campaigns} adsets={data.adsets} ads={data.ads} snapshot={data.snapshot} /></>}
       {tab === "Сводка" && <Summary summary={data.summary} />}
       {tab === "Google Ads" && <GoogleAds />}
     </div>

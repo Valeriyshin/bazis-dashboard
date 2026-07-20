@@ -24,7 +24,7 @@ interface ApiData {
   summary: { author: string; created_at: string; data: SummaryData | null } | null;
 }
 
-const TABS = ["Обзор", "Динамика", "Кампании", "Сводка"] as const;
+const TABS = ["Обзор", "Динамика", "Кампании", "Сводка", "Google Ads"] as const;
 type Tab = (typeof TABS)[number];
 const LINE_COLORS = ["#4f8cff", "#34d399", "#f59e0b", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#facc15", "#60a5fa", "#4ade80", "#fb923c"];
 
@@ -68,7 +68,120 @@ export default function Page() {
       {tab === "Динамика" && <Dynamics daily={data.daily} />}
       {tab === "Кампании" && <Breakdown campaigns={data.campaigns} adsets={data.adsets} ads={data.ads} snapshot={data.snapshot} />}
       {tab === "Сводка" && <Summary summary={data.summary} />}
+      {tab === "Google Ads" && <GoogleAds />}
     </div>
+  );
+}
+
+/* ============ Google Ads ============ */
+interface GCampaign {
+  campaign_id: string; name: string; status: string;
+  spend: number; impressions: number; clicks: number; ctr: number; cpc: number;
+  conversions: number; cost_per_conversion: number;
+}
+interface GData {
+  snapshot: { customer_id: string; period_start: string; period_end: string; created_at: string; currency: string };
+  daily: { date: string; spend: number; impressions: number; clicks: number; conversions: number }[];
+  campaigns: GCampaign[];
+}
+function GoogleAds() {
+  const [g, setG] = useState<GData | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [metric, setMetric] = useState<"spend" | "clicks" | "conversions" | "impressions">("spend");
+  const [sortKey, setSortKey] = useState<keyof GCampaign>("spend");
+  const [asc, setAsc] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/google").then((r) => r.json()).then((d) => { d.error ? setErr(d.error) : setG(d); }).catch((e) => setErr(String(e)));
+  }, []);
+
+  if (err) return <div className="panel err">Ошибка: {err}<div className="muted" style={{ marginTop: 8 }}>Запустите <code>npm run sync:google</code>.</div></div>;
+  if (!g) return <div className="center muted">Загрузка Google Ads…</div>;
+
+  const T = g.daily.reduce((a, r) => ({ spend: a.spend + r.spend, impressions: a.impressions + r.impressions, clicks: a.clicks + r.clicks, conversions: a.conversions + r.conversions }), { spend: 0, impressions: 0, clicks: 0, conversions: 0 });
+  const money = (n: number) => "$" + n.toLocaleString("ru-RU", { maximumFractionDigits: n < 100 ? 2 : 0 });
+  const int = (n: number) => Math.round(n).toLocaleString("ru-RU");
+  const cpa = T.conversions ? T.spend / T.conversions : 0;
+  const ctr = T.impressions ? (T.clicks / T.impressions) * 100 : 0;
+  const cpc = T.clicks ? T.spend / T.clicks : 0;
+
+  const kpis = [
+    { l: "Расход", v: money(T.spend) },
+    { l: "Конверсии", v: int(T.conversions) },
+    { l: "CPA (цена конв.)", v: money(cpa) },
+    { l: "Клики", v: int(T.clicks) },
+    { l: "CTR", v: ctr.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" },
+    { l: "CPC", v: money(cpc) },
+    { l: "Показы", v: int(T.impressions) },
+  ];
+  const METR = [
+    { k: "spend", l: "Расход" }, { k: "conversions", l: "Конверсии" }, { k: "clicks", l: "Клики" }, { k: "impressions", l: "Показы" },
+  ] as const;
+  const chart = g.daily.map((r) => ({ date: new Date(r.date).toLocaleDateString("ru-RU", { day: "2-digit", month: "short" }), value: r[metric] }));
+
+  const sorted = [...g.campaigns].sort((a, b) => {
+    const av = a[sortKey], bv = b[sortKey];
+    if (typeof av === "number" && typeof bv === "number") return asc ? av - bv : bv - av;
+    return asc ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
+  });
+  const setSort = (k: keyof GCampaign) => { if (k === sortKey) setAsc(!asc); else { setSortKey(k); setAsc(false); } };
+  const COLS: { k: keyof GCampaign; l: string; f: (n: number) => string }[] = [
+    { k: "spend", l: "Расход", f: money }, { k: "conversions", l: "Конв.", f: int },
+    { k: "cost_per_conversion", l: "CPA", f: money }, { k: "clicks", l: "Клики", f: int },
+    { k: "ctr", l: "CTR", f: (n) => n.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" },
+    { k: "cpc", l: "CPC", f: money }, { k: "impressions", l: "Показы", f: int },
+  ];
+
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-title">Google Ads · {g.snapshot.customer_id} · {new Date(g.snapshot.period_start).toLocaleDateString("ru-RU")} — {new Date(g.snapshot.period_end).toLocaleDateString("ru-RU")}</div>
+        <div className="kpi-grid">
+          {kpis.map((k) => (<div className="kpi" key={k.l}><div className="label">{k.l}</div><div className="value">{k.v}</div></div>))}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="controls">
+          <div className="field"><label>Метрика графика</label>
+            <select value={metric} onChange={(e) => setMetric(e.target.value as typeof metric)}>
+              {METR.map((m) => <option key={m.k} value={m.k}>{m.l}</option>)}
+            </select>
+          </div>
+        </div>
+        <ResponsiveContainer width="100%" height={340}>
+          <LineChart data={chart} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
+            <CartesianGrid stroke="#263042" strokeDasharray="3 3" />
+            <XAxis dataKey="date" stroke="#8b95a7" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
+            <YAxis stroke="#8b95a7" fontSize={11} width={64} />
+            <Tooltip contentStyle={{ background: "#141925", border: "1px solid #263042", borderRadius: 10, color: "#e6e9ef" }} />
+            <Line type="monotone" dataKey="value" stroke="#34d399" strokeWidth={2} dot={false} name={METR.find((m) => m.k === metric)?.l} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="panel">
+        <div className="panel-title">Кампании Google Ads ({g.campaigns.length})</div>
+        <div className="table-scroll">
+          <table>
+            <thead><tr>
+              <th onClick={() => setSort("name")}>Кампания</th>
+              <th onClick={() => setSort("status")}>Статус</th>
+              {COLS.map((c) => <th key={c.k} onClick={() => setSort(c.k)}>{c.l}{sortKey === c.k ? (asc ? " ▲" : " ▼") : ""}</th>)}
+            </tr></thead>
+            <tbody>
+              {sorted.map((c) => (
+                <tr key={c.campaign_id}>
+                  <td title={c.name} style={{ maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</td>
+                  <td><span className={"badge " + (c.status === "ACTIVE" ? "active" : "paused")}>{c.status === "ACTIVE" ? "Активна" : "Пауза"}</span></td>
+                  {COLS.map((col) => <td key={col.k}>{col.f(c[col.k] as number)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
   );
 }
 

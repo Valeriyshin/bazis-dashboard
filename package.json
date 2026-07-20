@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "sync": "node scripts/sync.mjs",
+    "sync:google": "node scripts/sync-google.mjs",
     "dev": "next dev -p 3005",
     "build": "next build",
     "start": "next start -p 3005"

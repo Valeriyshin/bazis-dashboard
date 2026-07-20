@@ -64,11 +64,122 @@ export default function Page() {
         ))}
       </div>
 
-      {tab === "Обзор" && <OverviewCompare daily={data.daily} />}
+      {tab === "Обзор" && <><OverviewCompare daily={data.daily} /><ZhkSummary metaCampaigns={data.campaigns} /></>}
       {tab === "Динамика" && <Dynamics daily={data.daily} />}
       {tab === "Кампании" && <Breakdown campaigns={data.campaigns} adsets={data.adsets} ads={data.ads} snapshot={data.snapshot} />}
       {tab === "Сводка" && <Summary summary={data.summary} />}
       {tab === "Google Ads" && <GoogleAds />}
+    </div>
+  );
+}
+
+/* ============ Сводка по ЖК (все системы) ============ */
+interface ZhkAgg { impressions: number; reach: number; clicks: number; leads: number; spend: number; typeSpend: Record<string, number> }
+function newAgg(): ZhkAgg { return { impressions: 0, reach: 0, clicks: 0, leads: 0, spend: 0, typeSpend: {} }; }
+function zhkOf(name: string): string {
+  const parts = String(name).split("|").map((s) => s.trim());
+  return parts[2] || parts[1] || "Прочее";
+}
+function domType(ts: Record<string, number>): string {
+  const e = Object.entries(ts).sort((a, b) => b[1] - a[1])[0];
+  return e ? e[0] : "—";
+}
+
+function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
+  const [google, setGoogle] = useState<GCampaign[] | null>(null);
+  useEffect(() => {
+    fetch("/api/google").then((r) => r.json()).then((d) => setGoogle(d.error ? [] : d.campaigns)).catch(() => setGoogle([]));
+  }, []);
+
+  // group[ЖК][система] = ZhkAgg
+  const group: Record<string, Record<string, ZhkAgg>> = {};
+  const add = (zhk: string, sys: string, patch: Partial<ZhkAgg> & { type?: string }) => {
+    (group[zhk] ??= {});
+    const a = (group[zhk][sys] ??= newAgg());
+    a.impressions += patch.impressions ?? 0; a.reach += patch.reach ?? 0; a.clicks += patch.clicks ?? 0;
+    a.leads += patch.leads ?? 0; a.spend += patch.spend ?? 0;
+    if (patch.type) a.typeSpend[patch.type] = (a.typeSpend[patch.type] ?? 0) + (patch.spend ?? 0);
+  };
+  for (const c of metaCampaigns) {
+    const cc = c as unknown as Record<string, number | string>;
+    add(zhkOf(c.name), "Meta", {
+      impressions: +cc.impressions, reach: +cc.reach, clicks: +cc.clicks,
+      leads: cc.result_type === "Лиды" ? +cc.results : 0, spend: +cc.spend,
+      type: (cc.result_type as string) || "—",
+    });
+  }
+  for (const c of google ?? []) {
+    add(zhkOf(c.name), "Google Ads", {
+      impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions, spend: c.spend, type: "Поиск",
+    });
+  }
+
+  const money = (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
+  const int = (n: number) => Math.round(n).toLocaleString("ru-RU");
+  const ctr = (a: ZhkAgg) => (a.impressions ? ((a.clicks / a.impressions) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—");
+  const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", TikTok: "⚫" };
+
+  // ЖК по убыванию суммарного расхода
+  const zhks = Object.keys(group).sort((x, y) => {
+    const sx = Object.values(group[y]).reduce((s, a) => s + a.spend, 0);
+    const sy = Object.values(group[x]).reduce((s, a) => s + a.spend, 0);
+    return sx - sy;
+  });
+
+  const grand = newAgg();
+  const rows: React.ReactNode[] = [];
+  for (const zhk of zhks) {
+    const systems = group[zhk];
+    const sub = newAgg();
+    for (const sys of Object.keys(systems).sort()) {
+      const a = systems[sys];
+      sub.impressions += a.impressions; sub.reach += a.reach; sub.clicks += a.clicks; sub.leads += a.leads; sub.spend += a.spend;
+      rows.push(
+        <tr key={zhk + sys}>
+          <td>{zhk}</td>
+          <td>{SYS_ICON[sys] ?? ""} {sys}</td>
+          <td>{domType(a.typeSpend)}</td>
+          <td>{int(a.impressions)}</td>
+          <td>{a.reach ? int(a.reach) : "—"}</td>
+          <td>{int(a.clicks)}</td>
+          <td>{ctr(a)}</td>
+          <td>{int(a.leads)}</td>
+          <td>{money(a.spend)}</td>
+        </tr>
+      );
+    }
+    grand.impressions += sub.impressions; grand.reach += sub.reach; grand.clicks += sub.clicks; grand.leads += sub.leads; grand.spend += sub.spend;
+    rows.push(
+      <tr key={zhk + "_total"} style={{ fontWeight: 700, background: "var(--panel-2)" }}>
+        <td>Итого {zhk}</td><td>—</td><td>—</td>
+        <td>{int(sub.impressions)}</td><td>{sub.reach ? int(sub.reach) : "—"}</td><td>{int(sub.clicks)}</td>
+        <td>{ctr(sub)}</td><td>{int(sub.leads)}</td><td>{money(sub.spend)}</td>
+      </tr>
+    );
+  }
+
+  return (
+    <div className="panel">
+      <div className="panel-title">Сводные данные по всем ЖК за период {google === null && <span className="muted">(загрузка Google…)</span>}</div>
+      <div className="table-scroll">
+        <table>
+          <thead><tr>
+            <th>ЖК</th><th>Система</th><th>Тип кампании</th><th>Показы</th><th>Охват</th><th>Клики</th><th>CTR</th><th>Кол-во лидов</th><th>Расход</th>
+          </tr></thead>
+          <tbody>
+            {rows}
+            <tr style={{ fontWeight: 700, borderTop: "2px solid var(--accent)" }}>
+              <td colSpan={3}>Общий итог</td>
+              <td>{int(grand.impressions)}</td><td>{int(grand.reach)}</td><td>{int(grand.clicks)}</td>
+              <td>{grand.impressions ? ((grand.clicks / grand.impressions) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
+              <td>{int(grand.leads)}</td><td>{money(grand.spend)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+        ЖК определяется как 3-е значение в названии кампании. «Лиды»: Meta — лид-формы, Google — конверсии. Охват Google API не отдаёт (—). TikTok подключим отдельно.
+      </div>
     </div>
   );
 }

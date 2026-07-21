@@ -62,7 +62,7 @@ async function gaql(token, customerId, loginCustomerId, query) {
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS google_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id TEXT, created_at TEXT, period_start TEXT, period_end TEXT, currency TEXT DEFAULT 'USD')`,
   `CREATE TABLE IF NOT EXISTS google_daily (snapshot_id INTEGER, date TEXT, spend REAL, impressions INTEGER, clicks INTEGER, conversions REAL, PRIMARY KEY (snapshot_id, date))`,
-  `CREATE TABLE IF NOT EXISTS google_campaigns (snapshot_id INTEGER, campaign_id TEXT, name TEXT, status TEXT, spend REAL, impressions INTEGER, clicks INTEGER, ctr REAL, cpc REAL, conversions REAL, cost_per_conversion REAL, PRIMARY KEY (snapshot_id, campaign_id))`,
+  `CREATE TABLE IF NOT EXISTS google_campaigns (snapshot_id INTEGER, campaign_id TEXT, name TEXT, status TEXT, channel TEXT, spend REAL, impressions INTEGER, clicks INTEGER, ctr REAL, cpc REAL, conversions REAL, cost_per_conversion REAL, PRIMARY KEY (snapshot_id, campaign_id))`,
 ];
 
 function dateRange(days) {
@@ -97,14 +97,20 @@ export async function runGoogleAdsSync(opts = {}) {
     conversions: num(r.metrics.conversions),
   }));
 
-  // Кампании.
+  // Кампании (advertising_channel_type — чтобы отличать Поиск / YouTube / КМС / PMax).
   const campRows = await gaql(token, cid, login,
-    `SELECT campaign.id, campaign.name, campaign.status, metrics.cost_micros, metrics.impressions,
+    `SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type,
+            metrics.cost_micros, metrics.impressions,
             metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.conversions, metrics.cost_per_conversion
      FROM campaign WHERE segments.date BETWEEN '${since}' AND '${until}'`);
+  const CHANNEL = {
+    SEARCH: "Поиск", VIDEO: "YouTube", DISPLAY: "КМС", PERFORMANCE_MAX: "PMax",
+    SHOPPING: "Торговая", DEMAND_GEN: "Demand Gen", MULTI_CHANNEL: "Multi", DISCOVERY: "Discovery",
+  };
   const camps = campRows.map((r) => ({
     id: String(r.campaign.id),
     name: r.campaign.name,
+    channel: CHANNEL[r.campaign.advertisingChannelType] || r.campaign.advertisingChannelType || "—",
     status: r.campaign.status === "ENABLED" ? "ACTIVE" : "PAUSED",
     spend: micros(r.metrics.costMicros),
     impressions: num(r.metrics.impressions),
@@ -117,6 +123,8 @@ export async function runGoogleAdsSync(opts = {}) {
 
   const conn = db();
   await conn.batch(SCHEMA, "write");
+  // Миграция для уже созданных БД: колонка channel.
+  try { await conn.execute("ALTER TABLE google_campaigns ADD COLUMN channel TEXT"); } catch { /* уже есть */ }
   const now = new Date().toISOString();
   const snap = await conn.execute({
     sql: "INSERT INTO google_snapshots (customer_id, created_at, period_start, period_end, currency) VALUES (?,?,?,?,?)",
@@ -126,7 +134,7 @@ export async function runGoogleAdsSync(opts = {}) {
 
   const stmts = [];
   for (const r of daily) stmts.push({ sql: "INSERT INTO google_daily (snapshot_id,date,spend,impressions,clicks,conversions) VALUES (?,?,?,?,?,?)", args: [snapId, r.date, r.spend, r.impressions, r.clicks, r.conversions] });
-  for (const r of camps) stmts.push({ sql: "INSERT INTO google_campaigns (snapshot_id,campaign_id,name,status,spend,impressions,clicks,ctr,cpc,conversions,cost_per_conversion) VALUES (?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.name, r.status, r.spend, r.impressions, r.clicks, r.ctr, r.cpc, r.conversions, r.cost_per_conversion] });
+  for (const r of camps) stmts.push({ sql: "INSERT INTO google_campaigns (snapshot_id,campaign_id,name,status,channel,spend,impressions,clicks,ctr,cpc,conversions,cost_per_conversion) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.name, r.status, r.channel, r.spend, r.impressions, r.clicks, r.ctr, r.cpc, r.conversions, r.cost_per_conversion] });
   if (stmts.length) await conn.batch(stmts, "write");
 
   return { snapshotId: snapId, since, until, days: daily.length, campaigns: camps.length };

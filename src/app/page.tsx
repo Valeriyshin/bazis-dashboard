@@ -75,9 +75,41 @@ export default function Page() {
 /* ============ Сводка по ЖК (все системы) ============ */
 interface ZhkAgg { impressions: number; reach: number; clicks: number; leads: number; spend: number; typeSpend: Record<string, number> }
 function newAgg(): ZhkAgg { return { impressions: 0, reach: 0, clicks: 0, leads: 0, spend: 0, typeSpend: {} }; }
+// Сегменты названия, которые точно НЕ являются ЖК (города, форматы, цели, бренд).
+const ZHK_STOP = new Set([
+  "Алматы", "Астана", "Шымкент", "Караганда", "Актобе", "Атырау",
+  "Search", "Общий Поиск", "Поиск", "Bazis-A", "Bazis", "BAZIS",
+  "РУС", "КАЗ", "CPA", "CPL", "CPM", "CPV", "CPE",
+  "Лиды", "Охват", "Вовлеченность", "Вовлечённость", "Лидген формы",
+  "YT Shorts", "YT InStream", "YouTube Multiple Formats", "Adv", "Adv+", "Wide", "LAL",
+]);
+const segs = (name: string) => String(name).split("|").map((s) => s.trim()).filter(Boolean);
+
+// Базовый разбор: первый «содержательный» сегмент начиная с 3-й позиции.
 function zhkOf(name: string): string {
-  const parts = String(name).split("|").map((s) => s.trim());
-  return parts[2] || parts[1] || "Прочее";
+  const p = segs(name);
+  for (let i = 2; i < p.length; i++) if (!ZHK_STOP.has(p[i])) return p[i];
+  return p[2] || p[1] || "Прочее";
+}
+
+// Умный разбор: сначала ищем совпадение с уже известными ЖК (нейминг Meta стабильнее),
+// иначе — базовый разбор. Нужно из-за разнобоя в названиях Google (ЖК бывает на 3-й и на 4-й позиции).
+function resolveZhk(name: string, known: Set<string>): string {
+  const p = segs(name);
+  // 1) точное совпадение сегмента с известным ЖК
+  for (const s of p) if (known.has(s)) return s;
+  // 2) известный ЖК как отдельное слово внутри сегмента («HUB ALMATY» → «HUB»,
+  //    «Benelux, A club» → «Benelux»). Сегмент 0 пропускаем — там код кампании.
+  let best: string | null = null;
+  for (const s of p.slice(1)) {
+    for (const k of known) {
+      if (k.length < 3) continue;
+      const re = new RegExp(`(^|[^\\p{L}\\p{N}])${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^\\p{L}\\p{N}]|$)`, "iu");
+      if (re.test(s) && (!best || k.length > best.length)) best = k;
+    }
+    if (best) return best;
+  }
+  return zhkOf(name);
 }
 function domType(ts: Record<string, number>): string {
   const e = Object.entries(ts).sort((a, b) => b[1] - a[1])[0];
@@ -118,24 +150,32 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
 
   // group[ЖК][система] = ZhkAgg
   const group: Record<string, Record<string, ZhkAgg>> = {};
+  // Ключ строки — система + тип кампании (Поиск / YouTube / КМС / Лиды / Охват),
+  // чтобы каждый тип был отдельной строкой и ничего не терялось.
   const add = (zhk: string, sys: string, patch: Partial<ZhkAgg> & { type?: string }) => {
     (group[zhk] ??= {});
-    const a = (group[zhk][sys] ??= newAgg());
+    const key = `${sys} ${patch.type || "—"}`;
+    const a = (group[zhk][key] ??= newAgg());
     a.impressions += patch.impressions ?? 0; a.reach += patch.reach ?? 0; a.clicks += patch.clicks ?? 0;
     a.leads += patch.leads ?? 0; a.spend += patch.spend ?? 0;
     if (patch.type) a.typeSpend[patch.type] = (a.typeSpend[patch.type] ?? 0) + (patch.spend ?? 0);
   };
+  // Известные ЖК берём из Meta — там нейминг последовательный.
+  const known = new Set(metaCampaigns.map((c) => zhkOf(c.name)).filter((z) => z && z !== "Прочее"));
+
   for (const c of metaCampaigns) {
     const cc = c as unknown as Record<string, number | string>;
-    add(zhkOf(c.name), "Meta", {
+    add(resolveZhk(c.name, known), "Meta", {
       impressions: +cc.impressions, reach: +cc.reach, clicks: +cc.clicks,
       leads: cc.result_type === "Лиды" ? +cc.results : 0, spend: +cc.spend,
       type: (cc.result_type as string) || "—",
     });
   }
   for (const c of google ?? []) {
-    add(zhkOf(c.name), "Google Ads", {
-      impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions, spend: c.spend, type: "Поиск",
+    const gc = c as unknown as Record<string, unknown>;
+    add(resolveZhk(c.name, known), "Google Ads", {
+      impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions, spend: c.spend,
+      type: (gc.channel as string) || "—",
     });
   }
 
@@ -160,14 +200,16 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   for (const zhk of zhks) {
     const systems = group[zhk];
     const sub = newAgg();
-    for (const sys of Object.keys(systems).sort()) {
-      const a = systems[sys];
+    for (const key of Object.keys(systems).sort((x, y) => systems[y].spend - systems[x].spend)) {
+      const a = systems[key];
+      const sys = key.startsWith("Google Ads") ? "Google Ads" : key.startsWith("Meta") ? "Meta" : "TikTok";
+      const typeLabel = key.slice(sys.length + 1) || "—";
       sub.impressions += a.impressions; sub.reach += a.reach; sub.clicks += a.clicks; sub.leads += a.leads; sub.spend += a.spend;
       rows.push(
-        <tr key={zhk + sys}>
+        <tr key={zhk + key}>
           <td>{zhk}</td>
           <td style={{ whiteSpace: "nowrap" }}>{SYS_ICON[sys] ?? ""} {sys}</td>
-          {active.map((c) => <td key={c.key}>{cell(c, a, true)}</td>)}
+          {active.map((c) => <td key={c.key}>{"type" in c && c.type ? typeLabel : cell(c, a, true)}</td>)}
         </tr>
       );
     }

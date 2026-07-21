@@ -38,10 +38,6 @@ export default async function LoginPage({
             Войти через Google
           </button>
         </form>
-
-        <div className="muted" style={{ marginTop: 18, fontSize: 12 }}>
-          Вход только для пользователей, которым выдан доступ.
-        </div>
       </div>
     </div>
   );

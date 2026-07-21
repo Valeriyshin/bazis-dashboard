@@ -55,7 +55,10 @@ export default function Page() {
             Кабинет {data.snapshot.account_id} · {fmtDate(data.snapshot.period_start)} — {fmtDate(data.snapshot.period_end)} · {data.snapshot.currency}
           </div>
         </div>
-        <RefreshBar snapshot={data.snapshot} />
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
+          <UserBar />
+          <RefreshBar snapshot={data.snapshot} />
+        </div>
       </div>
 
       <div className="tabs">
@@ -500,6 +503,22 @@ function GoogleCompare({ metaPeriod }: { metaPeriod?: { start: string; end: stri
         </div>
       )}
     </>
+  );
+}
+
+/* ============ Пользователь: кто вошёл, админка, выход ============ */
+function UserBar() {
+  const [me, setMe] = useState<{ email: string | null; isOwner: boolean } | null>(null);
+  useEffect(() => {
+    fetch("/api/me").then((r) => r.json()).then(setMe).catch(() => setMe(null));
+  }, []);
+  if (!me?.email) return null;
+  return (
+    <div style={{ display: "flex", gap: 10, alignItems: "center", fontSize: 12 }} className="muted">
+      <span>{me.email}</span>
+      {me.isOwner && <a href="/admin" className="pill" style={{ textDecoration: "none" }}>⚙️ Доступы</a>}
+      <a href="/api/auth/signout" className="pill" style={{ textDecoration: "none" }}>Выйти</a>
+    </div>
   );
 }
 

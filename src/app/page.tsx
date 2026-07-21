@@ -67,7 +67,7 @@ export default function Page() {
       {tab === "Обзор" && <><OverviewCompare daily={data.daily} /><ZhkSummary metaCampaigns={data.campaigns} /></>}
       {tab === "Meta" && <><Dynamics daily={data.daily} /><Breakdown campaigns={data.campaigns} adsets={data.adsets} ads={data.ads} snapshot={data.snapshot} /></>}
       {tab === "Сводка" && <Summary summary={data.summary} />}
-      {tab === "Google Ads" && <GoogleAds />}
+      {tab === "Google Ads" && <GoogleAds metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} />}
     </div>
   );
 }
@@ -228,13 +228,14 @@ interface GData {
   daily: { date: string; spend: number; impressions: number; clicks: number; conversions: number }[];
   campaigns: GCampaign[];
 }
-function GoogleAds() {
+function GoogleAds({ metaPeriod }: { metaPeriod?: { start: string; end: string } }) {
   const [g, setG] = useState<GData | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [metric, setMetric] = useState<"spend" | "clicks" | "conversions" | "impressions">("spend");
   const [sortKey, setSortKey] = useState<keyof GCampaign>("spend");
   const [asc, setAsc] = useState(false);
   const [cols, setCols] = useState<string[]>(["spend", "conversions", "cost_per_conversion", "clicks", "ctr", "cpc", "impressions"]);
+  const [mode, setMode] = useState<"stats" | "compare">("stats");
 
   useEffect(() => {
     fetch("/api/google").then((r) => r.json()).then((d) => { d.error ? setErr(d.error) : setG(d); }).catch((e) => setErr(String(e)));
@@ -279,8 +280,29 @@ function GoogleAds() {
   const activeCols = COLS.filter((c) => cols.includes(c.k));
   const toggleCol = (k: string) => setCols(cols.includes(k) ? cols.filter((x) => x !== k) : [...cols, k]);
 
+  const stale = metaPeriod && (metaPeriod.start !== g.snapshot.period_start || metaPeriod.end !== g.snapshot.period_end);
+
   return (
     <>
+      {stale && (
+        <div className="panel" style={{ borderColor: "var(--bad)" }}>
+          <b className="err">⚠ Период не совпадает с выбранным</b>
+          <div className="muted" style={{ marginTop: 6, fontSize: 12 }}>
+            Выбран {new Date(metaPeriod!.start).toLocaleDateString("ru-RU")} — {new Date(metaPeriod!.end).toLocaleDateString("ru-RU")},
+            а данные Google Ads за {new Date(g.snapshot.period_start).toLocaleDateString("ru-RU")} — {new Date(g.snapshot.period_end).toLocaleDateString("ru-RU")}.
+            Нажмите <b>↻ Обновить</b> в шапке, чтобы перевыгрузить обе системы за один период.
+          </div>
+        </div>
+      )}
+      <div className="panel">
+        <div className="chips">
+          <div className={"chip" + (mode === "stats" ? " on" : "")} onClick={() => setMode("stats")}>Показатели</div>
+          <div className={"chip" + (mode === "compare" ? " on" : "")} onClick={() => setMode("compare")}>Сравнение периодов</div>
+        </div>
+      </div>
+
+      {mode === "compare" && <GoogleCompare metaPeriod={metaPeriod} />}
+      {mode === "stats" && (<>
       <div className="panel">
         <div className="panel-title">Google Ads · {g.snapshot.customer_id} · {new Date(g.snapshot.period_start).toLocaleDateString("ru-RU")} — {new Date(g.snapshot.period_end).toLocaleDateString("ru-RU")}</div>
         <div className="kpi-grid">
@@ -337,6 +359,104 @@ function GoogleAds() {
           </table>
         </div>
       </div>
+      </>)}
+    </>
+  );
+}
+
+/* ============ Google Ads: сравнение двух периодов (живая выгрузка) ============ */
+const GCMP = [
+  { key: "conversions", label: "Конверсии", good: "up", fmt: (n: number) => Math.round(n).toLocaleString("ru-RU") },
+  { key: "cost_per_conversion", label: "CPA", good: "down", fmt: (n: number) => (n ? "$" + n.toFixed(2) : "—") },
+  { key: "spend", label: "Расход", good: "neutral", fmt: (n: number) => "$" + Math.round(n).toLocaleString("ru-RU") },
+  { key: "clicks", label: "Клики", good: "up", fmt: (n: number) => Math.round(n).toLocaleString("ru-RU") },
+  { key: "ctr", label: "CTR", good: "up", fmt: (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" },
+  { key: "cpc", label: "CPC", good: "down", fmt: (n: number) => (n ? "$" + n.toFixed(2) : "—") },
+  { key: "impressions", label: "Показы", good: "up", fmt: (n: number) => Math.round(n).toLocaleString("ru-RU") },
+] as const;
+
+interface GCmpRow { id: string; name: string; a?: Record<string, number>; b?: Record<string, number> }
+
+function GoogleCompare({ metaPeriod }: { metaPeriod?: { start: string; end: string } }) {
+  const base = metaPeriod ?? { start: "2026-07-01", end: "2026-07-14" };
+  const [aSince, setASince] = useState(base.start);
+  const [aUntil, setAUntil] = useState(base.start);
+  const [bSince, setBSince] = useState(base.end);
+  const [bUntil, setBUntil] = useState(base.end);
+  const [rows, setRows] = useState<GCmpRow[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const run = async () => {
+    setLoading(true); setErr(null);
+    try {
+      const res = await fetch("/api/google/compare", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ aSince, aUntil, bSince, bUntil }),
+      });
+      const j = await res.json();
+      if (!res.ok) { setErr(j.error || "Ошибка"); setRows(null); } else setRows(j.rows);
+    } catch (e) { setErr(String(e)); }
+    setLoading(false);
+  };
+
+  const delta = (m: (typeof GCMP)[number], r: GCmpRow) => {
+    const a = r.a?.[m.key] ?? 0, b = r.b?.[m.key] ?? 0;
+    if (!a && !b) return <span className="muted">—</span>;
+    const pct = a ? ((b - a) / a) * 100 : null;
+    let sent: "good" | "bad" | "neutral" = "neutral";
+    if (pct !== null && m.good !== "neutral" && Math.abs(pct) >= 0.5) sent = (m.good === "up") === (b > a) ? "good" : "bad";
+    return <span className={"delta " + sent}>{pct === null ? "—" : (pct > 0 ? "+" : "") + pct.toLocaleString("ru-RU", { maximumFractionDigits: 0 }) + "%"}</span>;
+  };
+  const DateF = ({ l, v, set }: { l: string; v: string; set: (s: string) => void }) => (
+    <div className="field"><label>{l}</label><input type="date" value={v} onChange={(e) => set(e.target.value)} /></div>
+  );
+
+  return (
+    <>
+      <div className="panel">
+        <div className="controls">
+          <DateF l="Период A — с" v={aSince} set={setASince} />
+          <DateF l="A — по" v={aUntil} set={setAUntil} />
+          <div style={{ alignSelf: "center", color: "var(--muted)", paddingTop: 14 }}>vs</div>
+          <DateF l="Период B — с" v={bSince} set={setBSince} />
+          <DateF l="B — по" v={bUntil} set={setBUntil} />
+          <button className="btn" onClick={run} disabled={loading} style={{ alignSelf: "end" }}>
+            {loading ? "⏳ Загрузка…" : "Сравнить"}
+          </button>
+        </div>
+        {err && <div className="err" style={{ marginTop: 10 }}>Ошибка: {err}</div>}
+      </div>
+
+      {rows && (
+        <div className="panel">
+          <div className="panel-title">Google Ads · сравнение A → B ({rows.length} кампаний)</div>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th rowSpan={2}>Кампания</th>
+                  {GCMP.map((m) => <th key={m.key} colSpan={3} style={{ textAlign: "center", borderBottom: "none" }}>{m.label}</th>)}
+                </tr>
+                <tr>{GCMP.map((m) => [<th key={m.key + "a"}>A</th>, <th key={m.key + "b"}>B</th>, <th key={m.key + "d"}>Δ</th>])}</tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.id}>
+                    <td title={r.name} style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</td>
+                    {GCMP.map((m) => [
+                      <td key={m.key + "a"}>{r.a ? m.fmt(r.a[m.key] ?? 0) : "—"}</td>,
+                      <td key={m.key + "b"}>{r.b ? m.fmt(r.b[m.key] ?? 0) : "—"}</td>,
+                      <td key={m.key + "d"}>{delta(m, r)}</td>,
+                    ])}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>Данные тянутся из Google Ads API за оба периода в реальном времени.</div>
+        </div>
+      )}
     </>
   );
 }
@@ -358,6 +478,12 @@ function RefreshBar({ snapshot }: { snapshot: ApiData["snapshot"] }) {
       });
       const j = await res.json();
       if (!res.ok) { setMsg("Ошибка: " + (j.error || res.status)); setLoading(false); return; }
+      // Google синхронизируется best-effort — если упал, показываем, а не молчим.
+      if (j.googleError) {
+        setMsg("Meta обновлена, но Google Ads не удалось: " + String(j.googleError).slice(0, 160));
+        setLoading(false);
+        return;
+      }
       setMsg("Готово, обновляю…");
       window.location.reload();
     } catch (e) {

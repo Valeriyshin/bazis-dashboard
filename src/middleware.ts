@@ -6,5 +6,5 @@ export const { auth: middleware } = NextAuth(authConfig);
 
 export const config = {
   // Не трогаем сам auth, статику и логин-страницу.
-  matcher: ["/((?!api/auth|api/tiktok/callback|login|_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!api/auth|api/tiktok/callback|api/yandex/callback|login|_next/static|_next/image|favicon.ico).*)"],
 };

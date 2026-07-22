@@ -24,7 +24,7 @@ interface ApiData {
   summary: { author: string; created_at: string; data: SummaryData | null } | null;
 }
 
-const TABS = ["Обзор", "Meta", "Сводка", "Google Ads"] as const;
+const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "Сводка"] as const;
 type Tab = (typeof TABS)[number];
 const LINE_COLORS = ["#4f8cff", "#34d399", "#f59e0b", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#facc15", "#60a5fa", "#4ade80", "#fb923c"];
 
@@ -71,6 +71,7 @@ export default function Page() {
       {tab === "Meta" && <><Dynamics daily={data.daily} /><Breakdown campaigns={data.campaigns} adsets={data.adsets} ads={data.ads} snapshot={data.snapshot} /></>}
       {tab === "Сводка" && <Summary summary={data.summary} />}
       {tab === "Google Ads" && <GoogleAds metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} />}
+      {tab === "Яндекс" && <YandexAds />}
     </div>
   );
 }
@@ -94,7 +95,7 @@ const ZHK_CANON: Record<string, string> = {
 const NON_ZHK = new Set([
   "Алматы", "Астана", "Шымкент", "Караганда", "Актобе", "Атырау", "Almaty", "Astana", "Shymkent",
   "Bazis-A", "Bazis", "BAZIS", "Premium", "PREMIUM",
-  "Search", "Общий Поиск", "Поиск", "Dgen", "DGen", "DGEN",
+  "Search", "Общий Поиск", "Поиск", "Dgen", "DGen", "DGEN", "РСЯ", "Сети", "Мастер кампаний",
   "РУС", "КАЗ", "CPA", "CPL", "CPM", "CPV", "CPC", "CPE",
   "Лиды", "Охват", "Вовлеченность", "Вовлечённость", "Лидген формы",
   "ThruPlay", "Thruplay", "Просмотры Thruplay", "Просмотры", "Охват SMM", "SMM",
@@ -155,11 +156,19 @@ const ZHK_COLS = [
 ] as const;
 const ZHK_DEFAULT = ["type", "impressions", "reach", "clicks", "ctr", "leads", "cpl", "spend"];
 
+interface YCampaign { campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
+
 function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   const [google, setGoogle] = useState<GCampaign[] | null>(null);
+  const [yandex, setYandex] = useState<YCampaign[] | null>(null);
+  const [rate, setRate] = useState(500); // ₸ за $1
   const [cols, setCols] = useState<string[]>(ZHK_DEFAULT);
   useEffect(() => {
     fetch("/api/google").then((r) => r.json()).then((d) => setGoogle(d.error ? [] : d.campaigns)).catch(() => setGoogle([]));
+    fetch("/api/yandex").then((r) => r.json()).then((d) => {
+      if (d.error) { setYandex([]); return; }
+      setYandex(d.campaigns); if (d.rate) setRate(d.rate);
+    }).catch(() => setYandex([]));
   }, []);
   const [sortKey, setSortKey] = useState<string>("spend");
   const [asc, setAsc] = useState(false);
@@ -212,8 +221,17 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
     if (isZero(patch)) continue;
     add(resolveZhk(c.name, canon), "Google Ads", patch);
   }
+  for (const c of yandex ?? []) {
+    // Яндекс отдаёт расход в тенге — приводим к $, чтобы итоги складывались корректно.
+    const patch = {
+      impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions,
+      spend: c.spend / rate, type: "Директ",
+    };
+    if (isZero(patch)) continue;
+    add(resolveZhk(c.name, canon), "Яндекс", patch);
+  }
 
-  const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", TikTok: "⚫" };
+  const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", "Яндекс": "🟡", TikTok: "⚫" };
   const cell = (c: (typeof ZHK_COLS)[number], a: ZhkAgg, isType: boolean) =>
     "type" in c && c.type ? (isType ? domType(a.typeSpend) : "—") : (c as { get: (a: ZhkAgg) => number; fmt: (n: number) => string }).fmt((c as { get: (a: ZhkAgg) => number }).get(a));
 
@@ -236,7 +254,8 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
     const sub = newAgg();
     for (const key of Object.keys(systems).sort((x, y) => systems[y].spend - systems[x].spend)) {
       const a = systems[key];
-      const sys = key.startsWith("Google Ads") ? "Google Ads" : key.startsWith("Meta") ? "Meta" : "TikTok";
+      const sys = key.startsWith("Google Ads") ? "Google Ads" : key.startsWith("Meta") ? "Meta"
+        : key.startsWith("Яндекс") ? "Яндекс" : "TikTok";
       const typeLabel = key.slice(sys.length + 1) || "—";
       sub.impressions += a.impressions; sub.reach += a.reach; sub.clicks += a.clicks; sub.leads += a.leads; sub.spend += a.spend;
       rows.push(
@@ -287,7 +306,8 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
         </table>
       </div>
       <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
-        ЖК определяется как 3-е значение в названии кампании. «Лиды»: Meta — лид-формы, Google — конверсии. Охват Google API не отдаёт (—). TikTok подключим отдельно.
+        ЖК определяется по названию кампании. «Лиды»: Meta — лид-формы, Google и Яндекс — конверсии.
+        Охват отдаёт только Meta (—). Расход Яндекса пересчитан из ₸ в $ по курсу <b>{rate}</b> (меняется в KZT_USD_RATE). TikTok подключим отдельно.
       </div>
     </div>
   );
@@ -550,6 +570,109 @@ function UserBar() {
       {me.isOwner && <a href="/admin" className="pill" style={{ textDecoration: "none" }}>⚙️ Доступы</a>}
       <a href="/api/auth/signout" className="pill" style={{ textDecoration: "none" }}>Выйти</a>
     </div>
+  );
+}
+
+/* ============ Яндекс.Директ ============ */
+interface YData {
+  snapshot: { client_login: string; period_start: string; period_end: string; currency: string };
+  rate: number;
+  daily: { date: string; spend: number; impressions: number; clicks: number; conversions: number }[];
+  campaigns: (YCampaign & { ctr: number; cpc: number; cost_per_conversion: number; status: string })[];
+}
+function YandexAds() {
+  const [y, setY] = useState<YData | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [metric, setMetric] = useState<"spend" | "clicks" | "conversions" | "impressions">("spend");
+  const [sortKey, setSortKey] = useState<string>("spend");
+  const [asc, setAsc] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/yandex").then((r) => r.json()).then((d) => { d.error ? setErr(d.error) : setY(d); }).catch((e) => setErr(String(e)));
+  }, []);
+
+  if (err) return <div className="panel err">Ошибка: {err}<div className="muted" style={{ marginTop: 8 }}>Запустите <code>npm run sync:yandex</code>.</div></div>;
+  if (!y) return <div className="center muted">Загрузка Яндекс.Директа…</div>;
+
+  const T = y.daily.reduce((a, r) => ({ spend: a.spend + r.spend, impressions: a.impressions + r.impressions, clicks: a.clicks + r.clicks, conversions: a.conversions + r.conversions }), { spend: 0, impressions: 0, clicks: 0, conversions: 0 });
+  const tg = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
+  const int = (n: number) => Math.round(n).toLocaleString("ru-RU");
+  const cpa = T.conversions ? T.spend / T.conversions : 0;
+  const ctr = T.impressions ? (T.clicks / T.impressions) * 100 : 0;
+  const cpc = T.clicks ? T.spend / T.clicks : 0;
+
+  const kpis = [
+    { l: "Расход", v: tg(T.spend) }, { l: "в долларах", v: "$" + Math.round(T.spend / y.rate).toLocaleString("ru-RU") },
+    { l: "Конверсии", v: int(T.conversions) }, { l: "CPA", v: tg(cpa) },
+    { l: "Клики", v: int(T.clicks) }, { l: "CTR", v: ctr.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" },
+    { l: "CPC", v: tg(cpc) }, { l: "Показы", v: int(T.impressions) },
+  ];
+  const METR = [{ k: "spend", l: "Расход" }, { k: "conversions", l: "Конверсии" }, { k: "clicks", l: "Клики" }, { k: "impressions", l: "Показы" }] as const;
+  const chart = y.daily.map((r) => ({ date: new Date(r.date).toLocaleDateString("ru-RU", { day: "2-digit", month: "short" }), value: r[metric] }));
+
+  const COLS = [
+    { k: "spend", l: "Расход", f: tg }, { k: "conversions", l: "Конв.", f: int },
+    { k: "cost_per_conversion", l: "CPA", f: tg }, { k: "clicks", l: "Клики", f: int },
+    { k: "ctr", l: "CTR", f: (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" },
+    { k: "cpc", l: "CPC", f: tg }, { k: "impressions", l: "Показы", f: int },
+  ];
+  const sorted = [...y.campaigns].sort((a, b) => {
+    const av = (a as unknown as Record<string, number>)[sortKey], bv = (b as unknown as Record<string, number>)[sortKey];
+    return asc ? av - bv : bv - av;
+  });
+  const setSort = (k: string) => { if (k === sortKey) setAsc(!asc); else { setSortKey(k); setAsc(false); } };
+
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-title">
+          Яндекс.Директ{y.snapshot.client_login ? ` · ${y.snapshot.client_login}` : ""} · {new Date(y.snapshot.period_start).toLocaleDateString("ru-RU")} — {new Date(y.snapshot.period_end).toLocaleDateString("ru-RU")}
+        </div>
+        <div className="kpi-grid">
+          {kpis.map((k) => (<div className="kpi" key={k.l}><div className="label">{k.l}</div><div className="value">{k.v}</div></div>))}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="controls">
+          <div className="field"><label>Метрика графика</label>
+            <select value={metric} onChange={(e) => setMetric(e.target.value as typeof metric)}>
+              {METR.map((m) => <option key={m.k} value={m.k}>{m.l}</option>)}
+            </select>
+          </div>
+        </div>
+        <ResponsiveContainer width="100%" height={340}>
+          <LineChart data={chart} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
+            <CartesianGrid stroke="#263042" strokeDasharray="3 3" />
+            <XAxis dataKey="date" stroke="#8b95a7" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
+            <YAxis stroke="#8b95a7" fontSize={11} width={70} />
+            <Tooltip contentStyle={{ background: "#141925", border: "1px solid #263042", borderRadius: 10, color: "#e6e9ef" }} />
+            <Line type="monotone" dataKey="value" stroke="#facc15" strokeWidth={2} dot={false} name={METR.find((m) => m.k === metric)?.l} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="panel">
+        <div className="panel-title">Кампании Яндекс.Директа ({y.campaigns.length})</div>
+        <div className="table-scroll">
+          <table>
+            <thead><tr>
+              <th>Кампания</th>
+              {COLS.map((c) => <th key={c.k} onClick={() => setSort(c.k)} style={{ cursor: "pointer" }}>{c.l}{sortKey === c.k ? (asc ? " ▲" : " ▼") : ""}</th>)}
+            </tr></thead>
+            <tbody>
+              {sorted.map((c) => (
+                <tr key={c.campaign_id}>
+                  <td title={c.name} style={{ maxWidth: 340, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</td>
+                  {COLS.map((col) => <td key={col.k}>{col.f((c as unknown as Record<string, number>)[col.k])}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>Суммы в тенге. Курс для сводки по ЖК: {y.rate} ₸ за $1.</div>
+      </div>
+    </>
   );
 }
 

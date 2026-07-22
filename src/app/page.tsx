@@ -97,6 +97,8 @@ const NON_ZHK = new Set([
   "Search", "Общий Поиск", "Поиск", "Dgen", "DGen", "DGEN",
   "РУС", "КАЗ", "CPA", "CPL", "CPM", "CPV", "CPC", "CPE",
   "Лиды", "Охват", "Вовлеченность", "Вовлечённость", "Лидген формы",
+  "ThruPlay", "Thruplay", "Просмотры Thruplay", "Просмотры", "Охват SMM", "SMM",
+  "Трафик", "Конверсии", "Продажи", "Сообщения", "Установки",
   "YT Shorts", "YT InStream", "YouTube Multiple Formats", "Adv", "Adv+", "Wide", "LAL",
 ].map(normz));
 

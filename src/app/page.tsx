@@ -78,41 +78,51 @@ export default function Page() {
 /* ============ Сводка по ЖК (все системы) ============ */
 interface ZhkAgg { impressions: number; reach: number; clicks: number; leads: number; spend: number; typeSpend: Record<string, number> }
 function newAgg(): ZhkAgg { return { impressions: 0, reach: 0, clicks: 0, leads: 0, spend: 0, typeSpend: {} }; }
-// Сегменты названия, которые точно НЕ являются ЖК (города, форматы, цели, бренд).
-const ZHK_STOP = new Set([
-  "Алматы", "Астана", "Шымкент", "Караганда", "Актобе", "Атырау",
-  "Search", "Общий Поиск", "Поиск", "Bazis-A", "Bazis", "BAZIS",
-  "РУС", "КАЗ", "CPA", "CPL", "CPM", "CPV", "CPE",
+const segs = (name: string) => String(name).split("|").map((s) => s.trim()).filter(Boolean);
+// Нормализация написания: без регистра, пробелов и пунктуации ("Nurly Dala 2" == "NURLY DALA 2").
+const normz = (s: string) => String(s).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Сегменты, которые НЕ являются ЖК: города, бренд, цели, форматы, языки.
+const NON_ZHK = new Set([
+  "Алматы", "Астана", "Шымкент", "Караганда", "Актобе", "Атырау", "Almaty", "Astana", "Shymkent",
+  "Bazis-A", "Bazis", "BAZIS", "Premium", "PREMIUM",
+  "Search", "Общий Поиск", "Поиск", "Dgen", "DGen", "DGEN",
+  "РУС", "КАЗ", "CPA", "CPL", "CPM", "CPV", "CPC", "CPE",
   "Лиды", "Охват", "Вовлеченность", "Вовлечённость", "Лидген формы",
   "YT Shorts", "YT InStream", "YouTube Multiple Formats", "Adv", "Adv+", "Wide", "LAL",
-]);
-const segs = (name: string) => String(name).split("|").map((s) => s.trim()).filter(Boolean);
+].map(normz));
 
-// Базовый разбор: первый «содержательный» сегмент начиная с 3-й позиции.
-function zhkOf(name: string): string {
-  const p = segs(name);
-  for (let i = 2; i < p.length; i++) if (!ZHK_STOP.has(p[i])) return p[i];
-  return p[2] || p[1] || "Прочее";
+// Содержательные сегменты названия (кандидаты на ЖК): без кода кампании, города, бренда, цели.
+function zhkCandidates(name: string): string[] {
+  return segs(name).slice(1).filter((s) => {
+    const n = normz(s);
+    if (!n || NON_ZHK.has(n)) return false;
+    if (/^#?\d+$/.test(s.trim())) return false; // "#2", "1"
+    if (/^(cpa|cpl|cpm|cpv|cpc|cpe)\d*$/.test(n)) return false; // "CPA", "CPA #2" → cpa2
+    return true;
+  });
 }
 
-// Умный разбор: сначала ищем совпадение с уже известными ЖК (нейминг Meta стабильнее),
-// иначе — базовый разбор. Нужно из-за разнобоя в названиях Google (ЖК бывает на 3-й и на 4-й позиции).
-function resolveZhk(name: string, known: Set<string>): string {
-  const p = segs(name);
-  // 1) точное совпадение сегмента с известным ЖК
-  for (const s of p) if (known.has(s)) return s;
-  // 2) известный ЖК как отдельное слово внутри сегмента («HUB ALMATY» → «HUB»,
-  //    «Benelux, A club» → «Benelux»). Сегмент 0 пропускаем — там код кампании.
-  let best: string | null = null;
-  for (const s of p.slice(1)) {
-    for (const k of known) {
-      if (k.length < 3) continue;
-      const re = new RegExp(`(^|[^\\p{L}\\p{N}])${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^\\p{L}\\p{N}]|$)`, "iu");
-      if (re.test(s) && (!best || k.length > best.length)) best = k;
+// Разбор ЖК с учётом разнобоя. canon: нормализованный ключ → каноничное отображаемое имя.
+// Заполняется из Meta (стабильный нейминг), дополняется по мере встречи новых ЖК.
+function resolveZhk(name: string, canon: Map<string, string>): string {
+  const cands = zhkCandidates(name);
+  if (cands.length === 0) return "Бренд / Общие";
+  // 1) точное совпадение по нормализованному ключу («Nurly Dala 2» == «NURLY DALA 2»)
+  for (const c of cands) { const k = normz(c); if (canon.has(k)) return canon.get(k)!; }
+  // 2) известный ЖК как отдельное слово внутри сегмента («HUB ALMATY» → «HUB», «Benelux, A club» → «Benelux»)
+  for (const c of cands) {
+    for (const disp of canon.values()) {
+      if (disp.length < 3) continue;
+      const re = new RegExp(`(^|[^\\p{L}\\p{N}])${reEsc(disp)}([^\\p{L}\\p{N}]|$)`, "iu");
+      if (re.test(c)) return disp;
     }
-    if (best) return best;
   }
-  return zhkOf(name);
+  // 3) новый ЖК — регистрируем по первому кандидату
+  const first = cands[0], key = normz(first);
+  if (!canon.has(key)) canon.set(key, first);
+  return canon.get(key)!;
 }
 function domType(ts: Record<string, number>): string {
   const e = Object.entries(ts).sort((a, b) => b[1] - a[1])[0];
@@ -163,23 +173,33 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
     a.leads += patch.leads ?? 0; a.spend += patch.spend ?? 0;
     if (patch.type) a.typeSpend[patch.type] = (a.typeSpend[patch.type] ?? 0) + (patch.spend ?? 0);
   };
-  // Известные ЖК берём из Meta — там нейминг последовательный.
-  const known = new Set(metaCampaigns.map((c) => zhkOf(c.name)).filter((z) => z && z !== "Прочее"));
+  // Каноничные ЖК: сначала из Meta (стабильный нейминг), затем дополняются из Google.
+  const canon = new Map<string, string>();
+  for (const c of metaCampaigns) {
+    const cs = zhkCandidates(c.name);
+    if (cs.length) { const k = normz(cs[0]); if (!canon.has(k)) canon.set(k, cs[0]); }
+  }
+  const isZero = (p: { impressions?: number; spend?: number; clicks?: number; leads?: number }) =>
+    !(p.impressions || 0) && !(p.spend || 0) && !(p.clicks || 0) && !(p.leads || 0);
 
   for (const c of metaCampaigns) {
     const cc = c as unknown as Record<string, number | string>;
-    add(resolveZhk(c.name, known), "Meta", {
+    const patch = {
       impressions: +cc.impressions, reach: +cc.reach, clicks: +cc.clicks,
       leads: cc.result_type === "Лиды" ? +cc.results : 0, spend: +cc.spend,
       type: (cc.result_type as string) || "—",
-    });
+    };
+    if (isZero(patch)) continue; // скрываем кампании без активности за период
+    add(resolveZhk(c.name, canon), "Meta", patch);
   }
   for (const c of google ?? []) {
     const gc = c as unknown as Record<string, unknown>;
-    add(resolveZhk(c.name, known), "Google Ads", {
+    const patch = {
       impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions, spend: c.spend,
       type: (gc.channel as string) || "—",
-    });
+    };
+    if (isZero(patch)) continue;
+    add(resolveZhk(c.name, canon), "Google Ads", patch);
   }
 
   const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", TikTok: "⚫" };

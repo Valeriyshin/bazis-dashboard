@@ -83,6 +83,13 @@ const segs = (name: string) => String(name).split("|").map((s) => s.trim()).filt
 const normz = (s: string) => String(s).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
 const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Ручные каноничные написания ЖК (нормализованный ключ → как показывать).
+// Перекрывает автоопределение, если в кабинетах пишут по-разному.
+const ZHK_CANON: Record<string, string> = {
+  "jandostar": "Jan Dostar",
+  "nurlydala2": "Nurly Dala II",
+};
+
 // Сегменты, которые НЕ являются ЖК: города, бренд, цели, форматы, языки.
 const NON_ZHK = new Set([
   "Алматы", "Астана", "Шымкент", "Караганда", "Актобе", "Атырау", "Almaty", "Astana", "Shymkent",
@@ -107,22 +114,24 @@ function zhkCandidates(name: string): string[] {
 // Разбор ЖК с учётом разнобоя. canon: нормализованный ключ → каноничное отображаемое имя.
 // Заполняется из Meta (стабильный нейминг), дополняется по мере встречи новых ЖК.
 function resolveZhk(name: string, canon: Map<string, string>): string {
+  // Ручная карта имеет приоритет над автоопределением.
+  const pick = (s: string) => ZHK_CANON[normz(s)] ?? s;
   const cands = zhkCandidates(name);
   if (cands.length === 0) return "Бренд / Общие";
   // 1) точное совпадение по нормализованному ключу («Nurly Dala 2» == «NURLY DALA 2»)
-  for (const c of cands) { const k = normz(c); if (canon.has(k)) return canon.get(k)!; }
+  for (const c of cands) { const k = normz(c); if (canon.has(k)) return pick(canon.get(k)!); }
   // 2) известный ЖК как отдельное слово внутри сегмента («HUB ALMATY» → «HUB», «Benelux, A club» → «Benelux»)
   for (const c of cands) {
     for (const disp of canon.values()) {
       if (disp.length < 3) continue;
       const re = new RegExp(`(^|[^\\p{L}\\p{N}])${reEsc(disp)}([^\\p{L}\\p{N}]|$)`, "iu");
-      if (re.test(c)) return disp;
+      if (re.test(c)) return pick(disp);
     }
   }
   // 3) новый ЖК — регистрируем по первому кандидату
   const first = cands[0], key = normz(first);
   if (!canon.has(key)) canon.set(key, first);
-  return canon.get(key)!;
+  return pick(canon.get(key)!);
 }
 function domType(ts: Record<string, number>): string {
   const e = Object.entries(ts).sort((a, b) => b[1] - a[1])[0];

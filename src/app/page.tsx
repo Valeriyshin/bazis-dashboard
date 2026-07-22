@@ -77,8 +77,9 @@ export default function Page() {
 }
 
 /* ============ Сводка по ЖК (все системы) ============ */
-interface ZhkAgg { impressions: number; reach: number; clicks: number; leads: number; spend: number; typeSpend: Record<string, number> }
-function newAgg(): ZhkAgg { return { impressions: 0, reach: 0, clicks: 0, leads: 0, spend: 0, typeSpend: {} }; }
+// spend — всегда в USD (канон), spendKzt — та же сумма в тенге.
+interface ZhkAgg { impressions: number; reach: number; clicks: number; leads: number; spend: number; spendKzt: number; typeSpend: Record<string, number> }
+function newAgg(): ZhkAgg { return { impressions: 0, reach: 0, clicks: 0, leads: 0, spend: 0, spendKzt: 0, typeSpend: {} }; }
 const segs = (name: string) => String(name).split("|").map((s) => s.trim()).filter(Boolean);
 // Нормализация написания: без регистра, пробелов и пунктуации ("Nurly Dala 2" == "NURLY DALA 2").
 const normz = (s: string) => String(s).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
@@ -152,22 +153,26 @@ const ZHK_COLS = [
   { key: "ctr", label: "CTR", get: (a: ZhkAgg) => (a.impressions ? (a.clicks / a.impressions) * 100 : 0), fmt: (n: number) => (n ? n.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—") },
   { key: "leads", label: "Кол-во лидов", get: (a: ZhkAgg) => a.leads, fmt: int0 },
   { key: "cpl", label: "Цена лида", get: (a: ZhkAgg) => (a.leads ? a.spend / a.leads : 0), fmt: (n: number) => (n ? "$" + n.toFixed(2) : "—") },
-  { key: "spend", label: "Расход", get: (a: ZhkAgg) => a.spend, fmt: money0 },
+  { key: "spend", label: "Расход $", get: (a: ZhkAgg) => a.spend, fmt: (n: number) => "$" + money0(n) },
+  { key: "spendKzt", label: "Расход ₸", get: (a: ZhkAgg) => a.spendKzt, fmt: (n: number) => money0(n) + " ₸" },
 ] as const;
-const ZHK_DEFAULT = ["type", "impressions", "reach", "clicks", "ctr", "leads", "cpl", "spend"];
+const ZHK_DEFAULT = ["type", "impressions", "reach", "clicks", "ctr", "leads", "cpl", "spend", "spendKzt"];
 
 interface YCampaign { campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
 
 function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   const [google, setGoogle] = useState<GCampaign[] | null>(null);
   const [yandex, setYandex] = useState<YCampaign[] | null>(null);
-  const [rate, setRate] = useState(500); // ₸ за $1
+  const [rate, setRate] = useState(500); // ₸ за $1 (эффективный за период)
+  const [fxMonths, setFxMonths] = useState<{ month: string; rate: number; days: number }[]>([]);
   const [cols, setCols] = useState<string[]>(ZHK_DEFAULT);
   useEffect(() => {
     fetch("/api/google").then((r) => r.json()).then((d) => setGoogle(d.error ? [] : d.campaigns)).catch(() => setGoogle([]));
     fetch("/api/yandex").then((r) => r.json()).then((d) => {
       if (d.error) { setYandex([]); return; }
-      setYandex(d.campaigns); if (d.rate) setRate(d.rate);
+      setYandex(d.campaigns);
+      if (d.rate) setRate(d.rate);
+      if (d.fxMonths) setFxMonths(d.fxMonths);
     }).catch(() => setYandex([]));
   }, []);
   const [sortKey, setSortKey] = useState<string>("spend");
@@ -190,7 +195,7 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
     const key = `${sys} ${patch.type || "—"}`;
     const a = (group[zhk][key] ??= newAgg());
     a.impressions += patch.impressions ?? 0; a.reach += patch.reach ?? 0; a.clicks += patch.clicks ?? 0;
-    a.leads += patch.leads ?? 0; a.spend += patch.spend ?? 0;
+    a.leads += patch.leads ?? 0; a.spend += patch.spend ?? 0; a.spendKzt += patch.spendKzt ?? 0;
     if (patch.type) a.typeSpend[patch.type] = (a.typeSpend[patch.type] ?? 0) + (patch.spend ?? 0);
   };
   // Каноничные ЖК: сначала из Meta (стабильный нейминг), затем дополняются из Google.
@@ -206,7 +211,8 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
     const cc = c as unknown as Record<string, number | string>;
     const patch = {
       impressions: +cc.impressions, reach: +cc.reach, clicks: +cc.clicks,
-      leads: cc.result_type === "Лиды" ? +cc.results : 0, spend: +cc.spend,
+      leads: cc.result_type === "Лиды" ? +cc.results : 0,
+      spend: +cc.spend, spendKzt: +cc.spend * rate,
       type: (cc.result_type as string) || "—",
     };
     if (isZero(patch)) continue; // скрываем кампании без активности за период
@@ -215,17 +221,18 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   for (const c of google ?? []) {
     const gc = c as unknown as Record<string, unknown>;
     const patch = {
-      impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions, spend: c.spend,
+      impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions,
+      spend: c.spend, spendKzt: c.spend * rate,
       type: (gc.channel as string) || "—",
     };
     if (isZero(patch)) continue;
     add(resolveZhk(c.name, canon), "Google Ads", patch);
   }
   for (const c of yandex ?? []) {
-    // Яндекс отдаёт расход в тенге — приводим к $, чтобы итоги складывались корректно.
+    // Яндекс отдаёт расход в тенге — в $ переводим по среднемесячному курсу НБ РК.
     const patch = {
       impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions,
-      spend: c.spend / rate, type: "Директ",
+      spend: c.spend / rate, spendKzt: c.spend, type: "Директ",
     };
     if (isZero(patch)) continue;
     add(resolveZhk(c.name, canon), "Яндекс", patch);
@@ -239,7 +246,7 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   const zhkTotal: Record<string, ZhkAgg> = {};
   for (const zhk of Object.keys(group)) {
     const t = newAgg();
-    for (const a of Object.values(group[zhk])) { t.impressions += a.impressions; t.reach += a.reach; t.clicks += a.clicks; t.leads += a.leads; t.spend += a.spend; }
+    for (const a of Object.values(group[zhk])) { t.impressions += a.impressions; t.reach += a.reach; t.clicks += a.clicks; t.leads += a.leads; t.spend += a.spend; t.spendKzt += a.spendKzt; }
     zhkTotal[zhk] = t;
   }
   const zhks = Object.keys(group).sort((x, y) => {
@@ -257,7 +264,7 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
       const sys = key.startsWith("Google Ads") ? "Google Ads" : key.startsWith("Meta") ? "Meta"
         : key.startsWith("Яндекс") ? "Яндекс" : "TikTok";
       const typeLabel = key.slice(sys.length + 1) || "—";
-      sub.impressions += a.impressions; sub.reach += a.reach; sub.clicks += a.clicks; sub.leads += a.leads; sub.spend += a.spend;
+      sub.impressions += a.impressions; sub.reach += a.reach; sub.clicks += a.clicks; sub.leads += a.leads; sub.spend += a.spend; sub.spendKzt += a.spendKzt;
       rows.push(
         <tr key={zhk + key}>
           <td>{zhk}</td>
@@ -266,7 +273,7 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
         </tr>
       );
     }
-    grand.impressions += sub.impressions; grand.reach += sub.reach; grand.clicks += sub.clicks; grand.leads += sub.leads; grand.spend += sub.spend;
+    grand.impressions += sub.impressions; grand.reach += sub.reach; grand.clicks += sub.clicks; grand.leads += sub.leads; grand.spend += sub.spend; grand.spendKzt += sub.spendKzt;
     rows.push(
       <tr key={zhk + "_total"} style={{ fontWeight: 700, background: "var(--panel-2)" }}>
         <td>Итого {zhk}</td><td>—</td>
@@ -306,8 +313,10 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
         </table>
       </div>
       <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
-        ЖК определяется по названию кампании. «Лиды»: Meta — лид-формы, Google и Яндекс — конверсии.
-        Охват отдаёт только Meta (—). Расход Яндекса пересчитан из ₸ в $ по курсу <b>{rate}</b> (меняется в KZT_USD_RATE). TikTok подключим отдельно.
+        ЖК определяется по названию кампании. «Лиды»: Meta — лид-формы, Google и Яндекс — конверсии. Охват отдаёт только Meta (—).
+        <br />Курс ₸/$ — среднемесячный по данным Нацбанка РК, за период <b>{rate}</b>
+        {fxMonths.length > 0 && <> ({fxMonths.map((m) => `${m.month}: ${m.rate}`).join(", ")})</>}.
+        Meta и Google приходят в $, Яндекс — в ₸. TikTok подключим отдельно.
       </div>
     </div>
   );

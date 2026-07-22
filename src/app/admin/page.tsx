@@ -3,9 +3,11 @@
 import { useEffect, useState } from "react";
 
 interface AUser { email: string; added_at: string; added_by: string; note: string }
+interface AReq { email: string; name: string; requested_at: string }
 
 export default function AdminPage() {
   const [users, setUsers] = useState<AUser[] | null>(null);
+  const [requests, setRequests] = useState<AReq[]>([]);
   const [owner, setOwner] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [email, setEmail] = useState("");
@@ -17,8 +19,18 @@ export default function AdminPage() {
     const j = await r.json();
     if (!r.ok) { setErr(j.error || "Ошибка"); setUsers([]); return; }
     setOwner(j.owner); setUsers(j.users); setErr(null);
+    const rr = await fetch("/api/admin/requests");
+    if (rr.ok) setRequests((await rr.json()).requests || []);
   };
   useEffect(() => { load(); }, []);
+
+  const handleReq = async (e: string, action: "approve" | "dismiss") => {
+    await fetch("/api/admin/requests", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: e, action }),
+    });
+    await load();
+  };
 
   const add = async () => {
     setBusy(true);
@@ -59,6 +71,30 @@ export default function AdminPage() {
         </div>
         <a href="/" className="btn ghost">← К дашборду</a>
       </div>
+
+      {requests.length > 0 && (
+        <div className="panel" style={{ borderColor: "var(--accent)" }}>
+          <div className="panel-title">🔔 Запросы на доступ ({requests.length})</div>
+          <div className="table-scroll">
+            <table>
+              <thead><tr><th>Email</th><th>Имя</th><th>Когда</th><th></th></tr></thead>
+              <tbody>
+                {requests.map((r) => (
+                  <tr key={r.email}>
+                    <td>{r.email}</td>
+                    <td className="muted">{r.name || "—"}</td>
+                    <td className="muted">{r.requested_at ? new Date(r.requested_at).toLocaleString("ru-RU") : "—"}</td>
+                    <td style={{ display: "flex", gap: 8 }}>
+                      <button className="btn" onClick={() => handleReq(r.email, "approve")}>Выдать доступ</button>
+                      <button className="btn ghost" onClick={() => handleReq(r.email, "dismiss")}>Отклонить</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       <div className="panel">
         <div className="panel-title">Выдать доступ</div>

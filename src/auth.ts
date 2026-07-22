@@ -23,6 +23,23 @@ export async function isAllowed(email: string): Promise<boolean> {
   return rs.rows.length > 0;
 }
 
+// Запросы на доступ от тех, кто залогинился, но не в списке.
+export async function ensureRequestsTable() {
+  const db = getDb();
+  await db.execute(
+    `CREATE TABLE IF NOT EXISTS access_requests (email TEXT PRIMARY KEY, name TEXT, requested_at TEXT)`
+  );
+  return db;
+}
+
+export async function recordAccessRequest(email: string, name: string) {
+  const db = await ensureRequestsTable();
+  await db.execute({
+    sql: "INSERT OR REPLACE INTO access_requests (email, name, requested_at) VALUES (?,?,?)",
+    args: [email.toLowerCase(), name || "", new Date().toISOString()],
+  });
+}
+
 export const { handlers, auth, signIn, signOut } = NextAuth({
   ...authConfig,
   callbacks: {
@@ -32,10 +49,13 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       const email = user?.email;
       if (!email) return false;
       try {
-        return await isAllowed(email);
+        if (await isAllowed(email)) return true;
+        // Нет доступа — оставляем запрос владельцу в админке.
+        await recordAccessRequest(email, user?.name || "");
       } catch {
-        return false;
+        /* не роняем вход из-за ошибки БД */
       }
+      return false;
     },
     async session({ session }) {
       if (session.user?.email) {

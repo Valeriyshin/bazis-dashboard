@@ -18,7 +18,13 @@ function db() {
   return createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN });
 }
 
-const REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports";
+// Боевой API требует одобренной заявки на доступ. Песочница работает сразу (тестовые данные):
+// YANDEX_SANDBOX=1 в .env.local переключает на неё.
+// Вычисляем в момент запроса — .env.local грузится уже внутри runYandexSync.
+const reportsUrl = () =>
+  process.env.YANDEX_SANDBOX === "1"
+    ? "https://api-sandbox.direct.yandex.com/json/v5/reports"
+    : "https://api.direct.yandex.com/json/v5/reports";
 const num = (v) => (v == null || v === "" || v === "--" ? 0 : Number(v));
 
 // Директ отдаёт деньги в микроединицах валюты.
@@ -42,7 +48,7 @@ function headers() {
 // Reports API отдаёт TSV. Возвращает массив объектов по заголовку.
 async function report(body) {
   for (let attempt = 0; attempt < 12; attempt++) {
-    const res = await fetch(REPORTS_URL, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    const res = await fetch(reportsUrl(), { method: "POST", headers: headers(), body: JSON.stringify(body) });
     // 201/202 — отчёт ставится в очередь, надо подождать и повторить тот же запрос.
     if (res.status === 201 || res.status === 202) {
       await new Promise((r) => setTimeout(r, 5000));

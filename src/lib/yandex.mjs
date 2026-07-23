@@ -45,7 +45,8 @@ function headers() {
   return h;
 }
 
-// Reports API отдаёт TSV. Возвращает массив объектов по заголовку.
+// Reports API отдаёт TSV. Возвращает { cols, rows } — заголовок нужен, чтобы
+// разобрать динамические колонки вида Conversions_<goalId>_<attribution>.
 async function report(body) {
   for (let attempt = 0; attempt < 12; attempt++) {
     const res = await fetch(reportsUrl(), { method: "POST", headers: headers(), body: JSON.stringify(body) });
@@ -57,15 +58,59 @@ async function report(body) {
     const text = await res.text();
     if (!res.ok) throw new Error(`Yandex Direct API ${res.status}: ${text.slice(0, 400)}`);
     const lines = text.trim().split("\n").filter(Boolean);
-    if (lines.length < 2) return [];
+    if (lines.length < 2) return { cols: [], rows: [] };
     const cols = lines[0].split("\t");
-    return lines.slice(1).map((l) => {
+    const rows = lines.slice(1).map((l) => {
       const parts = l.split("\t");
       return Object.fromEntries(cols.map((c, i) => [c, parts[i]]));
     });
+    return { cols, rows };
   }
   throw new Error("Yandex Direct: отчёт не готов после ожидания");
 }
+
+// Обычный вызов сервиса API (не Reports).
+async function api(service, method, params) {
+  const h = { ...headers() };
+  // Служебные заголовки Reports API здесь не нужны и мешают.
+  delete h.processingMode; delete h.returnMoneyInMicros;
+  delete h.skipReportHeader; delete h.skipColumnHeader; delete h.skipReportSummary;
+  const base = process.env.YANDEX_SANDBOX === "1"
+    ? "https://api-sandbox.direct.yandex.com/json/v5/"
+    : "https://api.direct.yandex.com/json/v5/";
+  const res = await fetch(base + service, { method: "POST", headers: h, body: JSON.stringify({ method, params }) });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { throw new Error(`Yandex ${service}: не JSON — ${text.slice(0, 200)}`); }
+  if (json.error) throw new Error(`Yandex ${service}: ${json.error.error_string} — ${json.error.error_detail}`);
+  return json.result;
+}
+
+// Поле Conversions без указания Goals суммирует ВСЕ цели Метрики, включая
+// автоцели, и завышает результат в разы (в кабинете Bazis-A — в 5,5 раза).
+// Поэтому берём приоритетные цели из настроек кампаний и считаем только по ним.
+async function fetchCampaignGoals() {
+  const result = await api("campaigns", "get", {
+    SelectionCriteria: {},
+    FieldNames: ["Id"],
+    TextCampaignFieldNames: ["PriorityGoals"],
+  });
+  const byCampaign = {};
+  for (const c of result?.Campaigns || []) {
+    const items = c.TextCampaign?.PriorityGoals?.Items || [];
+    // Цель 12 — служебная автоцель Директа («вовлечённая сессия»), не заявка.
+    const ids = items.map((g) => String(g.GoalId)).filter((id) => id !== "12" && id !== "13");
+    if (ids.length) byCampaign[String(c.Id)] = [...new Set(ids)];
+  }
+  return byCampaign;
+}
+
+// Reports API принимает не более 10 целей за запрос.
+const chunk = (arr, size) => {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+};
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS yandex_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, client_login TEXT, created_at TEXT, period_start TEXT, period_end TEXT, currency TEXT)`,
@@ -102,18 +147,64 @@ export async function runYandexSync(opts = {}) {
     },
   });
 
-  const dailyRaw = await report(base("daily", ["Date", "Impressions", "Clicks", "Cost", "Conversions"]));
-  const campRaw = await report(base("campaigns", ["CampaignId", "CampaignName", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc", "Conversions"]));
+  // Цели по кампаниям. Если получить не удалось — работаем без них, но честно
+  // помечаем результат, чтобы завышенные конверсии не выдавались за точные.
+  let campaignGoals = {}, goalsOk = false;
+  try {
+    campaignGoals = await fetchCampaignGoals();
+    goalsOk = Object.keys(campaignGoals).length > 0;
+  } catch (e) {
+    console.warn("Yandex: не удалось получить цели кампаний —", e.message);
+  }
 
-  const daily = dailyRaw.map((r) => ({
+  const dailyBase = await report(base("daily", ["Date", "Impressions", "Clicks", "Cost"]));
+  const campBase = await report(base("campaigns", ["CampaignId", "CampaignName", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc"]));
+
+  // Конверсии по целям: колонки приходят как Conversions_<goalId>_<attribution>.
+  // Запрашиваем батчами по 10 целей и для каждой кампании складываем только её цели.
+  const convByCampaign = {};   // campaignId -> конверсии
+  const convByDate = {};       // date -> конверсии
+  if (goalsOk) {
+    const allGoals = [...new Set(Object.values(campaignGoals).flat())];
+
+    // Разрез сразу по дате и кампании — так дневные и кампанийные суммы
+    // считаются из одних и тех же строк и не расходятся между собой.
+    for (const batch of chunk(allGoals, 10)) {
+      const { cols, rows } = await report({
+        params: {
+          ...base("campaigns", ["Date", "CampaignId", "Conversions"]).params,
+          ReportName: `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          Goals: batch,
+        },
+      });
+      const goalCols = cols
+        .filter((c) => /^Conversions_\d+_/.test(c))
+        .map((c) => [c, c.match(/^Conversions_(\d+)_/)[1]]);
+      for (const r of rows) {
+        const cid = String(r.CampaignId);
+        const own = campaignGoals[cid] || [];
+        for (const [col, goalId] of goalCols) {
+          // Цель засчитывается только той кампании, в настройках которой она стоит.
+          if (!own.includes(goalId)) continue;
+          const v = num(r[col]);
+          if (!v) continue;
+          convByCampaign[cid] = (convByCampaign[cid] || 0) + v;
+          convByDate[r.Date] = (convByDate[r.Date] || 0) + v;
+        }
+      }
+    }
+  }
+
+  const daily = dailyBase.rows.map((r) => ({
     date: r.Date,
     spend: money(r.Cost),
     impressions: num(r.Impressions),
     clicks: num(r.Clicks),
-    conversions: num(r.Conversions),
+    conversions: convByDate[r.Date] || 0,
   }));
-  const camps = campRaw.map((r) => {
-    const spend = money(r.Cost), conv = num(r.Conversions);
+  const camps = campBase.rows.map((r) => {
+    const spend = money(r.Cost);
+    const conv = convByCampaign[String(r.CampaignId)] || 0;
     return {
       id: String(r.CampaignId),
       name: r.CampaignName,
@@ -138,5 +229,10 @@ export async function runYandexSync(opts = {}) {
   for (const r of camps) stmts.push({ sql: "INSERT INTO yandex_campaigns (snapshot_id,campaign_id,name,status,spend,impressions,clicks,ctr,cpc,conversions,cost_per_conversion) VALUES (?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.name, r.status, r.spend, r.impressions, r.clicks, r.ctr, r.cpc, r.conversions, r.cost_per_conversion] });
   if (stmts.length) await conn.batch(stmts, "write");
 
-  return { snapshotId: snapId, since, until, days: daily.length, campaigns: camps.length };
+  const conversions = camps.reduce((s, c) => s + c.conversions, 0);
+  return {
+    snapshotId: snapId, since, until,
+    days: daily.length, campaigns: camps.length,
+    conversions, goalsApplied: goalsOk,
+  };
 }

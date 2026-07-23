@@ -8,4 +8,7 @@ export function runYandexSync(opts?: {
   until: string;
   days: number;
   campaigns: number;
+  conversions: number;
+  /** false — цели получить не удалось, конверсии могут быть завышены */
+  goalsApplied: boolean;
 }>;

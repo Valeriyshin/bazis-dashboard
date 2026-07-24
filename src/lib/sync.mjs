@@ -118,38 +118,81 @@ function dateRange(days) {
   return { since: iso(since), until: iso(until) };
 }
 
-// Главная функция. opts: {since, until, days}. Возвращает счётчики.
-export async function runSync(opts = {}) {
-  loadEnv();
-  const TOKEN = process.env.FB_ACCESS_TOKEN;
-  const ACCOUNT = process.env.FB_AD_ACCOUNT_ID || "1201997914797230";
-  if (!TOKEN) throw new Error("Нет FB_ACCESS_TOKEN (.env.local или переменные Vercel).");
+// Несколько рекламных аккаунтов одного клиента объединяются в одну сводку.
+// FB_AD_ACCOUNT_IDS — список через запятую; FB_AD_ACCOUNT_ID — старый одиночный формат,
+// поддержан для обратной совместимости.
+function accountIds() {
+  const list = process.env.FB_AD_ACCOUNT_IDS || process.env.FB_AD_ACCOUNT_ID || "1201997914797230";
+  return list.split(",").map((s) => s.trim()).filter(Boolean);
+}
 
-  const days = Number(opts.days) || Number(process.env.FB_DAYS) || 60;
-  const since = opts.since || process.env.FB_SINCE || dateRange(days).since;
-  const until = opts.until || process.env.FB_UNTIL || dateRange(days).until;
-  const tr = encodeURIComponent(JSON.stringify({ since, until }));
-  const q = (extra) => `${API}/act_${ACCOUNT}/insights?time_range=${tr}&limit=500&${extra}&access_token=${TOKEN}`;
-
+// Один аккаунт → { name, daily, camps, adsets, ads, campStatus, adsetStatus, adStatus }.
+async function fetchAccount(acc, TOKEN, tr) {
+  const q = (extra) => `${API}/act_${acc}/insights?time_range=${tr}&limit=500&${extra}&access_token=${TOKEN}`;
   const statusMap = async (edge) => {
-    const rows = await fetchAll(`${API}/act_${ACCOUNT}/${edge}?fields=id,effective_status&limit=500&access_token=${TOKEN}`);
+    const rows = await fetchAll(`${API}/act_${acc}/${edge}?fields=id,effective_status&limit=500&access_token=${TOKEN}`);
     return Object.fromEntries(rows.map((r) => [r.id, st(r.effective_status)]));
   };
-
-  const [daily, camps, adsets, ads, campStatus, adsetStatus, adStatus] = await Promise.all([
+  const [info, daily, camps, adsets, ads, campStatus, adsetStatus, adStatus] = await Promise.all([
+    fetch(`${API}/act_${acc}?fields=name&access_token=${TOKEN}`).then((r) => r.json()),
     fetchAll(q(`time_increment=1&fields=${CORE},cpp`)),
     fetchAll(q(`level=campaign&fields=campaign_id,campaign_name,objective,${CORE}`)),
     fetchAll(q(`level=adset&fields=adset_id,adset_name,campaign_id,objective,${CORE}`)),
     fetchAll(q(`level=ad&fields=ad_id,ad_name,campaign_id,adset_id,objective,${CORE}`)),
     statusMap("campaigns"), statusMap("adsets"), statusMap("ads"),
   ]);
+  return { acc, name: info.name || acc, daily, camps, adsets, ads, campStatus, adsetStatus, adStatus };
+}
 
-  // leads на уровне аккаунта по дням — берём из actions (нужно для KPI «Лиды/CPL» в Обзоре).
-  const dailyRows = daily.map((r) => ({ date: r.date_start, ...base(r), cpp: num(r.cpp), leads: leadsFrom(r.actions) }));
+// Суммирует дневные метрики нескольких аккаунтов по одной дате. Frequency/CTR/CPC/CPM
+// пересчитываются из просуммированных базовых величин, а не усредняются "в лоб" —
+// иначе при разных объёмах аккаунтов среднее было бы смещено в пользу меньшего.
+// Reach при этом складывается арифметически: пересечение аудиторий между двумя
+// аккаунтами Graph API не отдаёт, так что уникальный охват по факту будет чуть ниже.
+function mergeDaily(perAccount) {
+  const byDate = new Map();
+  for (const { daily } of perAccount) {
+    for (const r of daily) {
+      const d = r.date_start;
+      const acc = byDate.get(d) || { date: d, spend: 0, impressions: 0, reach: 0, clicks: 0, page_engagement: 0, link_click: 0, leads: 0 };
+      acc.spend += num(r.spend); acc.impressions += num(r.impressions); acc.reach += num(r.reach);
+      acc.clicks += num(r.clicks); acc.page_engagement += actionVal(r, "page_engagement");
+      acc.link_click += actionVal(r, "link_click"); acc.leads += leadsFrom(r.actions);
+      byDate.set(d, acc);
+    }
+  }
+  return [...byDate.values()].map((r) => ({
+    ...r,
+    frequency: r.reach ? r.impressions / r.reach : 0,
+    cpc: r.clicks ? r.spend / r.clicks : 0,
+    cpm: r.impressions ? (r.spend / r.impressions) * 1000 : 0,
+    cpp: r.reach ? (r.spend / r.reach) * 1000 : 0,
+    ctr: r.impressions ? (r.clicks / r.impressions) * 100 : 0,
+  }));
+}
+
+// Главная функция. opts: {since, until, days}. Возвращает счётчики.
+export async function runSync(opts = {}) {
+  loadEnv();
+  const TOKEN = process.env.FB_ACCESS_TOKEN;
+  const ACCOUNTS = accountIds();
+  if (!TOKEN) throw new Error("Нет FB_ACCESS_TOKEN (.env.local или переменные Vercel).");
+
+  const days = Number(opts.days) || Number(process.env.FB_DAYS) || 60;
+  const since = opts.since || process.env.FB_SINCE || dateRange(days).since;
+  const until = opts.until || process.env.FB_UNTIL || dateRange(days).until;
+  const tr = encodeURIComponent(JSON.stringify({ since, until }));
+
+  const perAccount = await Promise.all(ACCOUNTS.map((acc) => fetchAccount(acc, TOKEN, tr)));
+
+  const dailyRows = mergeDaily(perAccount);
   const results = {};
-  const campRows = camps.map((r) => { const ri = resultInfo(r); results[r.campaign_id] = ri; return { id: r.campaign_id, name: r.campaign_name, objective: r.objective || "", status: campStatus[r.campaign_id] ?? "PAUSED", ...base(r), ...ri }; });
-  const adsetRows = adsets.map((r) => ({ id: r.adset_id, campaign_id: r.campaign_id, name: r.adset_name, status: adsetStatus[r.adset_id] ?? "PAUSED", ...base(r), ...resultInfo(r) }));
-  const adRows = ads.map((r) => ({ id: r.ad_id, campaign_id: r.campaign_id, adset_id: r.adset_id, name: r.ad_name, status: adStatus[r.ad_id] ?? "PAUSED", ...base(r), ...resultInfo(r) }));
+  const campRows = [], adsetRows = [], adRows = [];
+  for (const a of perAccount) {
+    for (const r of a.camps) { const ri = resultInfo(r); results[r.campaign_id] = ri; campRows.push({ id: r.campaign_id, name: r.campaign_name, objective: r.objective || "", status: a.campStatus[r.campaign_id] ?? "PAUSED", ...base(r), ...ri }); }
+    for (const r of a.adsets) adsetRows.push({ id: r.adset_id, campaign_id: r.campaign_id, name: r.adset_name, status: a.adsetStatus[r.adset_id] ?? "PAUSED", ...base(r), ...resultInfo(r) });
+    for (const r of a.ads) adRows.push({ id: r.ad_id, campaign_id: r.campaign_id, adset_id: r.adset_id, name: r.ad_name, status: a.adStatus[r.ad_id] ?? "PAUSED", ...base(r), ...resultInfo(r) });
+  }
   const summary = buildSummary(dailyRows, campRows, results, since, until);
 
   const db = client();
@@ -160,7 +203,7 @@ export async function runSync(opts = {}) {
   const now = new Date().toISOString();
   const snapRes = await db.execute({
     sql: "INSERT INTO snapshots (account_id, account_name, created_at, period_start, period_end, currency) VALUES (?,?,?,?,?,?)",
-    args: [ACCOUNT, "TDS Media | BAZIS-A Corp", now, since, until, "USD"],
+    args: [ACCOUNTS.join(","), perAccount.map((a) => a.name).join(" + "), now, since, until, "USD"],
   });
   const snapId = Number(snapRes.lastInsertRowid);
 

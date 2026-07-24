@@ -1,3 +1,4 @@
+/** Синкает один или несколько аккаунтов Meta (см. FB_AD_ACCOUNT_IDS) и объединяет их в одну сводку. */
 export function runSync(opts?: {
   since?: string;
   until?: string;

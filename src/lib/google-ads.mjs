@@ -71,6 +71,36 @@ function dateRange(days) {
   const iso = (d) => d.toISOString().slice(0, 10);
   return { since: iso(since), until: iso(until) };
 }
+const addDays = (iso, n) => {
+  const d = new Date(iso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const todayIso = () => new Date().toISOString().slice(0, 10);
+
+// У Google Ads нет жёсткого лимита глубины истории (проверено — запрос на 2018 год
+// не дал ошибки), но неограниченно расти базе тоже незачем. Держим ту же глубину,
+// что и у Meta (её реальный лимит — 37 месяцев), для консистентности между кабинетами.
+function historyFloor() {
+  const d = new Date();
+  d.setUTCMonth(d.getUTCMonth() - 37);
+  d.setUTCDate(d.getUTCDate() + 2);
+  return d.toISOString().slice(0, 10);
+}
+const RECON_DAYS = Number(process.env.GA_RECON_DAYS) || 14;
+
+// Самое свежее известное значение на каждую дату по ВСЕМ прошлым снапшотам —
+// узкий ручной синк за пару дней не должен «стирать» накопленную историю.
+async function knownDaily(conn) {
+  const rs = await conn.execute(`
+    SELECT gd.* FROM google_daily gd
+    JOIN (SELECT date, MAX(snapshot_id) AS sid FROM google_daily GROUP BY date) latest
+      ON gd.date = latest.date AND gd.snapshot_id = latest.sid
+  `);
+  const map = new Map();
+  for (const r of rs.rows) map.set(String(r.date), r);
+  return map;
+}
 
 export async function runGoogleAdsSync(opts = {}) {
   loadEnv();
@@ -80,29 +110,61 @@ export async function runGoogleAdsSync(opts = {}) {
   if (!dev || !process.env.GOOGLE_ADS_CLIENT_ID || !process.env.GOOGLE_ADS_REFRESH_TOKEN || !cid)
     throw new Error("Не хватает Google Ads кредов в .env.local (DEVELOPER_TOKEN, CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN, CUSTOMER_ID).");
 
-  const days = Number(opts.days) || Number(process.env.GA_DAYS) || 60;
-  const since = opts.since || dateRange(days).since;
-  const until = opts.until || dateRange(days).until;
-  const token = await accessToken();
+  const until = opts.until || todayIso();
+  const explicitDays = Number(opts.days) || Number(process.env.GA_DAYS) || 0;
+  const requestedSince = opts.since || (explicitDays ? dateRange(explicitDays).since : historyFloor());
+  const floor = historyFloor();
+  const since = requestedSince < floor ? floor : requestedSince;
 
-  // Подневная статистика аккаунта.
-  const dailyRows = await gaql(token, cid, login,
-    `SELECT segments.date, metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.conversions
-     FROM customer WHERE segments.date BETWEEN '${since}' AND '${until}'`);
-  const daily = dailyRows.map((r) => ({
-    date: r.segments.date,
-    spend: micros(r.metrics.costMicros),
-    impressions: num(r.metrics.impressions),
-    clicks: num(r.metrics.clicks),
-    conversions: num(r.metrics.conversions),
-  }));
+  // Разбивка по кампаниям — короткое окно (как раньше, 60 дней): глубокая история
+  // старых кампаний тут не нужна, а сама выгрузка растёт вместе с числом кампаний.
+  const entityDays = explicitDays || Number(process.env.GA_ENTITY_DAYS) || 60;
+  const sinceEntity = opts.since || dateRange(entityDays).since;
+
+  const token = await accessToken();
+  const conn = db();
+  await conn.batch(SCHEMA, "write");
+  try { await conn.execute("ALTER TABLE google_campaigns ADD COLUMN channel TEXT"); } catch { /* уже есть */ }
+
+  // Подневная статистика аккаунта — только окно сверки (там ещё досчитывается
+  // атрибуция) плюс недостающая ранняя история; остальное берём из того, что уже знаем.
+  const known = await knownDaily(conn);
+  const reconStart = addDays(until, -(RECON_DAYS - 1));
+  const fetchRanges = [];
+  if (known.size === 0) {
+    fetchRanges.push([since, until]);
+  } else {
+    const earliestKnown = [...known.keys()].sort()[0];
+    if (since < earliestKnown) fetchRanges.push([since, addDays(earliestKnown, -1)]);
+    const tailStart = reconStart > since ? reconStart : since;
+    fetchRanges.push([tailStart, until]);
+  }
+
+  const fresh = [];
+  for (const [rs, ru] of fetchRanges) {
+    const rows = await gaql(token, cid, login,
+      `SELECT segments.date, metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.conversions
+       FROM customer WHERE segments.date BETWEEN '${rs}' AND '${ru}'`);
+    fresh.push(...rows);
+  }
+  const freshByDate = new Map(fresh.map((r) => [r.segments.date, {
+    date: r.segments.date, spend: micros(r.metrics.costMicros), impressions: num(r.metrics.impressions),
+    clicks: num(r.metrics.clicks), conversions: num(r.metrics.conversions),
+  }]));
+
+  const daily = [];
+  for (let d = since; d <= until; d = addDays(d, 1)) {
+    if (freshByDate.has(d)) { daily.push(freshByDate.get(d)); continue; }
+    const k = known.get(d);
+    if (k) daily.push({ date: d, spend: num(k.spend), impressions: num(k.impressions), clicks: num(k.clicks), conversions: num(k.conversions) });
+  }
 
   // Кампании (advertising_channel_type — чтобы отличать Поиск / YouTube / КМС / PMax).
   const campRows = await gaql(token, cid, login,
     `SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type,
             metrics.cost_micros, metrics.impressions,
             metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.conversions, metrics.cost_per_conversion
-     FROM campaign WHERE segments.date BETWEEN '${since}' AND '${until}'`);
+     FROM campaign WHERE segments.date BETWEEN '${sinceEntity}' AND '${until}'`);
   const CHANNEL = {
     SEARCH: "Поиск", VIDEO: "YouTube", DISPLAY: "КМС", PERFORMANCE_MAX: "PMax",
     SHOPPING: "Торговая", DEMAND_GEN: "Demand Gen", MULTI_CHANNEL: "Multi", DISCOVERY: "Discovery",
@@ -121,14 +183,10 @@ export async function runGoogleAdsSync(opts = {}) {
     cost_per_conversion: micros(r.metrics.costPerConversion),
   }));
 
-  const conn = db();
-  await conn.batch(SCHEMA, "write");
-  // Миграция для уже созданных БД: колонка channel.
-  try { await conn.execute("ALTER TABLE google_campaigns ADD COLUMN channel TEXT"); } catch { /* уже есть */ }
   const now = new Date().toISOString();
   const snap = await conn.execute({
     sql: "INSERT INTO google_snapshots (customer_id, created_at, period_start, period_end, currency) VALUES (?,?,?,?,?)",
-    args: [cid, now, since, until, "USD"],
+    args: [cid, now, sinceEntity, until, "USD"],
   });
   const snapId = Number(snap.lastInsertRowid);
 
@@ -137,5 +195,9 @@ export async function runGoogleAdsSync(opts = {}) {
   for (const r of camps) stmts.push({ sql: "INSERT INTO google_campaigns (snapshot_id,campaign_id,name,status,channel,spend,impressions,clicks,ctr,cpc,conversions,cost_per_conversion) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.name, r.status, r.channel, r.spend, r.impressions, r.clicks, r.ctr, r.cpc, r.conversions, r.cost_per_conversion] });
   if (stmts.length) await conn.batch(stmts, "write");
 
-  return { snapshotId: snapId, since, until, days: daily.length, campaigns: camps.length };
+  return {
+    snapshotId: snapId, since: sinceEntity, until,
+    days: daily.filter((r) => r.date >= sinceEntity).length, campaigns: camps.length,
+    dailyHistorySince: since, dailyHistoryDays: daily.length,
+  };
 }

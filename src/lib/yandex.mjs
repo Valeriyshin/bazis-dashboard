@@ -124,21 +124,87 @@ function dateRange(days) {
   const iso = (d) => d.toISOString().slice(0, 10);
   return { since: iso(since), until: iso(until) };
 }
+const addDays = (iso, n) => {
+  const d = new Date(iso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const todayIso = () => new Date().toISOString().slice(0, 10);
+
+// Яндекс отдаёт статистику максимум за 3 года от текущего МЕСЯЦА (проверено —
+// точная граница месяца в ответе API), поэтому округляем с небольшим запасом.
+function historyFloor() {
+  const d = new Date();
+  d.setUTCMonth(d.getUTCMonth() - 35, 1);
+  return d.toISOString().slice(0, 10);
+}
+const RECON_DAYS = Number(process.env.YA_RECON_DAYS) || 14;
+
+async function knownDaily(conn) {
+  const rs = await conn.execute(`
+    SELECT yd.* FROM yandex_daily yd
+    JOIN (SELECT date, MAX(snapshot_id) AS sid FROM yandex_daily GROUP BY date) latest
+      ON yd.date = latest.date AND yd.snapshot_id = latest.sid
+  `);
+  const map = new Map();
+  for (const r of rs.rows) map.set(String(r.date), r);
+  return map;
+}
+
+// Конверсии по целям за конкретный диапазон, в разрезе по дате (для дневного ряда)
+// или по кампании (для разбивки) — то же устройство отчёта, разный groupBy.
+async function goalConversions(campaignGoals, sinceR, untilR, groupField) {
+  const out = {}; // date или campaignId -> сумма конверсий
+  const allGoals = [...new Set(Object.values(campaignGoals).flat())];
+  if (!allGoals.length) return out;
+  for (const batch of chunk(allGoals, 10)) {
+    const { cols, rows } = await report({
+      params: {
+        SelectionCriteria: { DateFrom: sinceR, DateTo: untilR },
+        FieldNames: groupField === "Date" ? ["Date", "CampaignId", "Conversions"] : ["CampaignId", "Conversions"],
+        ReportName: `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        ReportType: "CAMPAIGN_PERFORMANCE_REPORT",
+        DateRangeType: "CUSTOM_DATE",
+        Format: "TSV",
+        IncludeVAT: "NO",
+        IncludeDiscount: "NO",
+        Goals: batch,
+      },
+    });
+    const goalCols = cols.filter((c) => /^Conversions_\d+_/.test(c)).map((c) => [c, c.match(/^Conversions_(\d+)_/)[1]]);
+    for (const r of rows) {
+      const cid = String(r.CampaignId);
+      const own = campaignGoals[cid] || [];
+      const key = groupField === "Date" ? r.Date : cid;
+      for (const [col, goalId] of goalCols) {
+        if (!own.includes(goalId)) continue; // цель засчитывается только "своей" кампании
+        const v = num(r[col]);
+        if (!v) continue;
+        out[key] = (out[key] || 0) + v;
+      }
+    }
+  }
+  return out;
+}
 
 export async function runYandexSync(opts = {}) {
   loadEnv();
   if (!process.env.YANDEX_OAUTH_TOKEN) throw new Error("Нет YANDEX_OAUTH_TOKEN в .env.local");
 
-  const days = Number(opts.days) || Number(process.env.YA_DAYS) || 60;
-  const since = opts.since || dateRange(days).since;
-  const until = opts.until || dateRange(days).until;
-  const range = { DateFrom: since, DateTo: until };
+  const until = opts.until || todayIso();
+  const explicitDays = Number(opts.days) || Number(process.env.YA_DAYS) || 0;
+  const requestedSince = opts.since || (explicitDays ? dateRange(explicitDays).since : historyFloor());
+  const floor = historyFloor();
+  const since = requestedSince < floor ? floor : requestedSince;
 
-  const base = (name, fields) => ({
+  const entityDays = explicitDays || Number(process.env.YA_ENTITY_DAYS) || 60;
+  const sinceEntity = opts.since || dateRange(entityDays).since;
+
+  const base = (name, sinceR, untilR, fields) => ({
     params: {
-      SelectionCriteria: range,
+      SelectionCriteria: { DateFrom: sinceR, DateTo: untilR },
       FieldNames: fields,
-      ReportName: `${name}_${Date.now()}`,
+      ReportName: `${name}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       ReportType: name === "daily" ? "ACCOUNT_PERFORMANCE_REPORT" : "CAMPAIGN_PERFORMANCE_REPORT",
       DateRangeType: "CUSTOM_DATE",
       Format: "TSV",
@@ -157,51 +223,42 @@ export async function runYandexSync(opts = {}) {
     console.warn("Yandex: не удалось получить цели кампаний —", e.message);
   }
 
-  const dailyBase = await report(base("daily", ["Date", "Impressions", "Clicks", "Cost"]));
-  const campBase = await report(base("campaigns", ["CampaignId", "CampaignName", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc"]));
+  const conn = db();
+  await conn.batch(SCHEMA, "write");
 
-  // Конверсии по целям: колонки приходят как Conversions_<goalId>_<attribution>.
-  // Запрашиваем батчами по 10 целей и для каждой кампании складываем только её цели.
-  const convByCampaign = {};   // campaignId -> конверсии
-  const convByDate = {};       // date -> конверсии
-  if (goalsOk) {
-    const allGoals = [...new Set(Object.values(campaignGoals).flat())];
-
-    // Разрез сразу по дате и кампании — так дневные и кампанийные суммы
-    // считаются из одних и тех же строк и не расходятся между собой.
-    for (const batch of chunk(allGoals, 10)) {
-      const { cols, rows } = await report({
-        params: {
-          ...base("campaigns", ["Date", "CampaignId", "Conversions"]).params,
-          ReportName: `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          Goals: batch,
-        },
-      });
-      const goalCols = cols
-        .filter((c) => /^Conversions_\d+_/.test(c))
-        .map((c) => [c, c.match(/^Conversions_(\d+)_/)[1]]);
-      for (const r of rows) {
-        const cid = String(r.CampaignId);
-        const own = campaignGoals[cid] || [];
-        for (const [col, goalId] of goalCols) {
-          // Цель засчитывается только той кампании, в настройках которой она стоит.
-          if (!own.includes(goalId)) continue;
-          const v = num(r[col]);
-          if (!v) continue;
-          convByCampaign[cid] = (convByCampaign[cid] || 0) + v;
-          convByDate[r.Date] = (convByDate[r.Date] || 0) + v;
-        }
-      }
-    }
+  // Дневная статистика — только окно сверки + недостающая ранняя история;
+  // остальное берём из того, что уже знаем по всем прошлым снапшотам.
+  const known = await knownDaily(conn);
+  const reconStart = addDays(until, -(RECON_DAYS - 1));
+  const fetchRanges = [];
+  if (known.size === 0) {
+    fetchRanges.push([since, until]);
+  } else {
+    const earliestKnown = [...known.keys()].sort()[0];
+    if (since < earliestKnown) fetchRanges.push([since, addDays(earliestKnown, -1)]);
+    const tailStart = reconStart > since ? reconStart : since;
+    fetchRanges.push([tailStart, until]);
   }
 
-  const daily = dailyBase.rows.map((r) => ({
-    date: r.Date,
-    spend: money(r.Cost),
-    impressions: num(r.Impressions),
-    clicks: num(r.Clicks),
-    conversions: convByDate[r.Date] || 0,
-  }));
+  const freshByDate = new Map();
+  for (const [rs, ru] of fetchRanges) {
+    const { rows } = await report(base("daily", rs, ru, ["Date", "Impressions", "Clicks", "Cost"]));
+    const convByDate = goalsOk ? await goalConversions(campaignGoals, rs, ru, "Date") : {};
+    for (const r of rows) {
+      freshByDate.set(r.Date, { date: r.Date, spend: money(r.Cost), impressions: num(r.Impressions), clicks: num(r.Clicks), conversions: convByDate[r.Date] || 0 });
+    }
+  }
+  const daily = [];
+  for (let d = since; d <= until; d = addDays(d, 1)) {
+    if (freshByDate.has(d)) { daily.push(freshByDate.get(d)); continue; }
+    const k = known.get(d);
+    if (k) daily.push({ date: d, spend: num(k.spend), impressions: num(k.impressions), clicks: num(k.clicks), conversions: num(k.conversions) });
+  }
+
+  // Кампании — короткое окно, как раньше.
+  const campBase = await report(base("campaigns", sinceEntity, until, ["CampaignId", "CampaignName", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc"]));
+  const convByCampaign = goalsOk ? await goalConversions(campaignGoals, sinceEntity, until, "CampaignId") : {};
+
   const camps = campBase.rows.map((r) => {
     const spend = money(r.Cost);
     const conv = convByCampaign[String(r.CampaignId)] || 0;
@@ -215,12 +272,10 @@ export async function runYandexSync(opts = {}) {
     };
   });
 
-  const conn = db();
-  await conn.batch(SCHEMA, "write");
   const now = new Date().toISOString();
   const snap = await conn.execute({
     sql: "INSERT INTO yandex_snapshots (client_login, created_at, period_start, period_end, currency) VALUES (?,?,?,?,?)",
-    args: [process.env.YANDEX_CLIENT_LOGIN || "", now, since, until, process.env.YANDEX_CURRENCY || "KZT"],
+    args: [process.env.YANDEX_CLIENT_LOGIN || "", now, sinceEntity, until, process.env.YANDEX_CURRENCY || "KZT"],
   });
   const snapId = Number(snap.lastInsertRowid);
 
@@ -231,8 +286,9 @@ export async function runYandexSync(opts = {}) {
 
   const conversions = camps.reduce((s, c) => s + c.conversions, 0);
   return {
-    snapshotId: snapId, since, until,
-    days: daily.length, campaigns: camps.length,
+    snapshotId: snapId, since: sinceEntity, until,
+    days: daily.filter((r) => r.date >= sinceEntity).length, campaigns: camps.length,
+    dailyHistorySince: since, dailyHistoryDays: daily.length,
     conversions, goalsApplied: goalsOk,
   };
 }

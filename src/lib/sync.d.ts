@@ -11,4 +11,8 @@ export function runSync(opts?: {
   campaigns: number;
   adsets: number;
   ads: number;
+  /** С какой даты реально хранится дневная история (может уходить глубже since). */
+  dailyHistorySince: string;
+  /** Сколько дней с активностью реально накоплено в daily_insights. */
+  dailyHistoryDays: number;
 }>;

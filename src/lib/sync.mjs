@@ -117,6 +117,39 @@ function dateRange(days) {
   const iso = (d) => d.toISOString().slice(0, 10);
   return { since: iso(since), until: iso(until) };
 }
+const addDays = (iso, n) => {
+  const d = new Date(iso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const todayIso = () => new Date().toISOString().slice(0, 10);
+
+// Meta не отдаёт insights глубже 37 месяцев от сегодня (ошибка 3018) — берём
+// с небольшим запасом внутрь границы, чтобы не упереться в неё из-за округления.
+function historyFloor() {
+  const d = new Date();
+  d.setUTCMonth(d.getUTCMonth() - 37);
+  d.setUTCDate(d.getUTCDate() + 2);
+  return d.toISOString().slice(0, 10);
+}
+
+// Сколько последних дней всегда перезапрашивать заново: рекламные кабинеты
+// досчитывают конверсии/атрибуцию задним числом ещё несколько дней после факта.
+const RECON_DAYS = Number(process.env.FB_RECON_DAYS) || 14;
+
+// Что мы уже знаем по дням на уровне аккаунта — берём САМОЕ СВЕЖЕЕ известное
+// значение на каждую дату по ВСЕМ прошлым снапшотам (не только последнему).
+// Так узкий ручной синк за пару дней не «стирает» уже накопленную длинную историю.
+async function knownDaily(db) {
+  const rs = await db.execute(`
+    SELECT di.* FROM daily_insights di
+    JOIN (SELECT date, MAX(snapshot_id) AS sid FROM daily_insights GROUP BY date) latest
+      ON di.date = latest.date AND di.snapshot_id = latest.sid
+  `);
+  const map = new Map();
+  for (const r of rs.rows) map.set(String(r.date), r);
+  return map;
+}
 
 // Несколько рекламных аккаунтов одного клиента объединяются в одну сводку.
 // FB_AD_ACCOUNT_IDS — список через запятую; FB_AD_ACCOUNT_ID — старый одиночный формат,
@@ -126,22 +159,33 @@ function accountIds() {
   return list.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-// Один аккаунт → { name, daily, camps, adsets, ads, campStatus, adsetStatus, adStatus }.
-async function fetchAccount(acc, TOKEN, tr) {
+// Один аккаунт → { name, camps, adsets, ads, campStatus, adsetStatus, adStatus }.
+// Кампании/группы/объявления — это агрегат за весь period одним вызовом (его стоимость
+// не растёт от длины периода так, как у time_increment=1), поэтому окно сверки к ним не
+// применяется: просто всегда просим весь [since,until] и получаем точные текущие суммы.
+async function fetchAccountMeta(acc, TOKEN, tr) {
   const q = (extra) => `${API}/act_${acc}/insights?time_range=${tr}&limit=500&${extra}&access_token=${TOKEN}`;
   const statusMap = async (edge) => {
     const rows = await fetchAll(`${API}/act_${acc}/${edge}?fields=id,effective_status&limit=500&access_token=${TOKEN}`);
     return Object.fromEntries(rows.map((r) => [r.id, st(r.effective_status)]));
   };
-  const [info, daily, camps, adsets, ads, campStatus, adsetStatus, adStatus] = await Promise.all([
+  const [info, camps, adsets, ads, campStatus, adsetStatus, adStatus] = await Promise.all([
     fetch(`${API}/act_${acc}?fields=name&access_token=${TOKEN}`).then((r) => r.json()),
-    fetchAll(q(`time_increment=1&fields=${CORE},cpp`)),
     fetchAll(q(`level=campaign&fields=campaign_id,campaign_name,objective,${CORE}`)),
     fetchAll(q(`level=adset&fields=adset_id,adset_name,campaign_id,objective,${CORE}`)),
     fetchAll(q(`level=ad&fields=ad_id,ad_name,campaign_id,adset_id,objective,${CORE}`)),
     statusMap("campaigns"), statusMap("adsets"), statusMap("ads"),
   ]);
-  return { acc, name: info.name || acc, daily, camps, adsets, ads, campStatus, adsetStatus, adStatus };
+  return { acc, name: info.name || acc, camps, adsets, ads, campStatus, adsetStatus, adStatus };
+}
+
+// Дневные метрики account-уровня за один конкретный поддиапазон (time_increment=1).
+// Это единственный вызов, чья "цена" растёт вместе с длиной периода — поэтому именно
+// его мы просим только за окно сверки + недостающую историю, а не за весь период целиком.
+async function fetchAccountDaily(acc, TOKEN, sinceR, untilR) {
+  const tr = encodeURIComponent(JSON.stringify({ since: sinceR, until: untilR }));
+  const url = `${API}/act_${acc}/insights?time_range=${tr}&time_increment=1&limit=500&fields=${CORE},cpp&access_token=${TOKEN}`;
+  return fetchAll(url);
 }
 
 // Суммирует дневные метрики нескольких аккаунтов по одной дате. Frequency/CTR/CPC/CPM
@@ -178,14 +222,62 @@ export async function runSync(opts = {}) {
   const ACCOUNTS = accountIds();
   if (!TOKEN) throw new Error("Нет FB_ACCESS_TOKEN (.env.local или переменные Vercel).");
 
-  const days = Number(opts.days) || Number(process.env.FB_DAYS) || 60;
-  const since = opts.since || process.env.FB_SINCE || dateRange(days).since;
-  const until = opts.until || process.env.FB_UNTIL || dateRange(days).until;
-  const tr = encodeURIComponent(JSON.stringify({ since, until }));
+  const until = opts.until || process.env.FB_UNTIL || todayIso();
+  // Явный days/since — как раньше (ручной запрос конкретного периода). Без него —
+  // вся доступная история сразу, а не скользящие 60 дней.
+  const explicitDays = Number(opts.days) || Number(process.env.FB_DAYS) || 0;
+  const requestedSince = opts.since || process.env.FB_SINCE || (explicitDays ? dateRange(explicitDays).since : historyFloor());
+  const floor = historyFloor();
+  const since = requestedSince < floor ? floor : requestedSince; // глубже 37 месяцев Meta всё равно не отдаст
 
-  const perAccount = await Promise.all(ACCOUNTS.map((acc) => fetchAccount(acc, TOKEN, tr)));
+  // У разбивки по кампаниям/группам/объявлениям цена вызова растёт вместе с длиной
+  // периода — за 3 года это тысячи давно остановленных сущностей и пагинация уходит
+  // в лимит запросов Meta ("Application request limit reached", проверено на практике).
+  // Поэтому полная история — только для дневного тренда аккаунта (он лёгкий и не
+  // пагинируется так же тяжело), а разбивка держится в разумном окне, как раньше.
+  const entityDays = explicitDays || Number(process.env.FB_ENTITY_DAYS) || 60;
+  const sinceEntity = opts.since || process.env.FB_SINCE || dateRange(entityDays).since;
 
-  const dailyRows = mergeDaily(perAccount);
+  const db = client();
+  await db.batch(SCHEMA, "write");
+  // Миграция для уже созданных БД: добавить колонку leads, если её ещё нет.
+  try { await db.execute("ALTER TABLE daily_insights ADD COLUMN leads INTEGER"); } catch { /* уже есть */ }
+
+  // Кампании/группы/объявления — весь запрошенный (короткий) период одним вызовом на аккаунт.
+  const trFull = encodeURIComponent(JSON.stringify({ since: sinceEntity, until }));
+  const perAccount = await Promise.all(ACCOUNTS.map((acc) => fetchAccountMeta(acc, TOKEN, trFull)));
+
+  // Дневные метрики — только окно сверки (досчёт атрибуции) плюс недостающая ранняя
+  // история; всё остальное внутри [since, until] переносим из того, что уже знаем.
+  const known = await knownDaily(db);
+  const reconStart = addDays(until, -(RECON_DAYS - 1));
+  const fetchRanges = [];
+  if (known.size === 0) {
+    fetchRanges.push([since, until]); // совсем чистая база — тянем всё одним диапазоном
+  } else {
+    const earliestKnown = [...known.keys()].sort()[0];
+    if (since < earliestKnown) fetchRanges.push([since, addDays(earliestKnown, -1)]);
+    const tailStart = reconStart > since ? reconStart : since;
+    fetchRanges.push([tailStart, until]);
+  }
+
+  const perAccountDaily = await Promise.all(
+    ACCOUNTS.map(async (acc) => {
+      const chunks = await Promise.all(fetchRanges.map(([rs, ru]) => fetchAccountDaily(acc, TOKEN, rs, ru)));
+      return { daily: chunks.flat() };
+    })
+  );
+  const freshByDate = new Map(mergeDaily(perAccountDaily).map((r) => [r.date, r]));
+
+  // Собираем полный ряд по дням: свежее (из API) + известное раньше (без API) на каждую дату диапазона.
+  const dailyRows = [];
+  for (let d = since; d <= until; d = addDays(d, 1)) {
+    if (freshByDate.has(d)) { dailyRows.push(freshByDate.get(d)); continue; }
+    const k = known.get(d);
+    if (k) dailyRows.push({ date: d, spend: num(k.spend), impressions: num(k.impressions), reach: num(k.reach), frequency: num(k.frequency), clicks: num(k.clicks), cpc: num(k.cpc), cpm: num(k.cpm), cpp: num(k.cpp), ctr: num(k.ctr), page_engagement: num(k.page_engagement), link_click: num(k.link_click), leads: num(k.leads) });
+    // ни там ни там — до открытия кабинета/вне активности, пропускаем день
+  }
+
   const results = {};
   const campRows = [], adsetRows = [], adRows = [];
   for (const a of perAccount) {
@@ -193,17 +285,15 @@ export async function runSync(opts = {}) {
     for (const r of a.adsets) adsetRows.push({ id: r.adset_id, campaign_id: r.campaign_id, name: r.adset_name, status: a.adsetStatus[r.adset_id] ?? "PAUSED", ...base(r), ...resultInfo(r) });
     for (const r of a.ads) adRows.push({ id: r.ad_id, campaign_id: r.campaign_id, adset_id: r.adset_id, name: r.ad_name, status: a.adStatus[r.ad_id] ?? "PAUSED", ...base(r), ...resultInfo(r) });
   }
-  const summary = buildSummary(dailyRows, campRows, results, since, until);
-
-  const db = client();
-  await db.batch(SCHEMA, "write");
-  // Миграция для уже созданных БД: добавить колонку leads, если её ещё нет.
-  try { await db.execute("ALTER TABLE daily_insights ADD COLUMN leads INTEGER"); } catch { /* уже есть */ }
+  // Сводка (текст + KPI) описывает период кампаний, а не глубокую историю по дням —
+  // иначе тренд "первая половина vs вторая" смешает многолетний ряд с недельными цифрами.
+  const summaryDaily = dailyRows.filter((r) => r.date >= sinceEntity);
+  const summary = buildSummary(summaryDaily, campRows, results, sinceEntity, until);
 
   const now = new Date().toISOString();
   const snapRes = await db.execute({
     sql: "INSERT INTO snapshots (account_id, account_name, created_at, period_start, period_end, currency) VALUES (?,?,?,?,?,?)",
-    args: [ACCOUNTS.join(","), perAccount.map((a) => a.name).join(" + "), now, since, until, "USD"],
+    args: [ACCOUNTS.join(","), perAccount.map((a) => a.name).join(" + "), now, sinceEntity, until, "USD"],
   });
   const snapId = Number(snapRes.lastInsertRowid);
 
@@ -215,5 +305,9 @@ export async function runSync(opts = {}) {
   stmts.push({ sql: "INSERT INTO summaries (snapshot_id, body, author, created_at) VALUES (?,?,?,?)", args: [snapId, JSON.stringify(summary), "Claude", now] });
 
   await db.batch(stmts, "write");
-  return { snapshotId: snapId, since, until, days: dailyRows.length, campaigns: campRows.length, adsets: adsetRows.length, ads: adRows.length };
+  return {
+    snapshotId: snapId, since: sinceEntity, until,
+    days: summaryDaily.length, campaigns: campRows.length, adsets: adsetRows.length, ads: adRows.length,
+    dailyHistorySince: since, dailyHistoryDays: dailyRows.length, // сколько всего дней с активностью реально в базе
+  };
 }

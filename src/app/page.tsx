@@ -302,16 +302,21 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
       const monthName = new Date().toLocaleDateString("ru-RU", { month: "long" });
       const ws = wb.addWorksheet(`Общий ${monthName}`.slice(0, 31));
 
-      // Строки 1-3 — параметры выгрузки (жёлтые, редактируются прямо в файле, формулы
-      // ниже их подхватывают через $B$1/$B$2/$B$3). Строка 4 пустая. Строка 5 — заголовок.
-      const RATE_ROW = 1, AK_ROW = 2, NDS_ROW = 3, HEADER_ROW = 5, FIRST_DATA_ROW = 6;
+      // Строки 1-4 — параметры выгрузки (жёлтые, редактируются прямо в файле, формулы
+      // ниже их подхватывают через $B$1:$B$4). Строка 5 — заголовок.
+      // Расход с НДС и АК считается по-разному для Яндекса и остальных площадок:
+      //   Яндекс: L × 0.95 × (1+НДС)      — фиксированный коэффициент 0.95, не (1+АК)
+      //   Остальные (Meta/Google/TikTok): L × (1+АК) × (1+НДС)
+      const RATE_ROW = 1, AK_ROW = 2, NDS_ROW = 3, YA_COEF_ROW = 4, HEADER_ROW = 5, FIRST_DATA_ROW = 6;
       ws.getCell(`D${RATE_ROW}`).value = "Курс $ →₸ (ручной, для этой выгрузки):";
       ws.getCell(`B${RATE_ROW}`).value = rateNum; ws.getCell(`B${RATE_ROW}`).numFmt = "0.00";
-      ws.getCell(`D${AK_ROW}`).value = "АК, %:";
+      ws.getCell(`D${AK_ROW}`).value = "АК, % (Meta/Google/TikTok):";
       ws.getCell(`B${AK_ROW}`).value = akPct / 100; ws.getCell(`B${AK_ROW}`).numFmt = "0%";
       ws.getCell(`D${NDS_ROW}`).value = "НДС, %:";
       ws.getCell(`B${NDS_ROW}`).value = ndsPct / 100; ws.getCell(`B${NDS_ROW}`).numFmt = "0%";
-      for (const row of [RATE_ROW, AK_ROW, NDS_ROW]) {
+      ws.getCell(`D${YA_COEF_ROW}`).value = "Коэфф. Яндекс (вместо 1+АК):";
+      ws.getCell(`B${YA_COEF_ROW}`).value = 0.95; ws.getCell(`B${YA_COEF_ROW}`).numFmt = "0.00";
+      for (const row of [RATE_ROW, AK_ROW, NDS_ROW, YA_COEF_ROW]) {
         ws.getCell(`D${row}`).font = { bold: true, name: "Arial" };
         ws.getCell(`B${row}`).font = { name: "Arial" };
         ws.getCell(`B${row}`).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
@@ -349,7 +354,9 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
           row.getCell(10).value = { formula: `IF(H${r}=0,0,K${r}/H${r})` };  // CR = лиды/клики
           row.getCell(11).value = a.leads;
           row.getCell(12).value = isYandex ? spendRaw : { formula: `${spendRaw}*$B$${RATE_ROW}` };
-          row.getCell(13).value = { formula: `L${r}*(1+$B$${AK_ROW})*(1+$B$${NDS_ROW})` };
+          row.getCell(13).value = isYandex
+            ? { formula: `L${r}*$B$${YA_COEF_ROW}*(1+$B$${NDS_ROW})` }   // Яндекс: L×0.95×(1+НДС)
+            : { formula: `L${r}*(1+$B$${AK_ROW})*(1+$B$${NDS_ROW})` };   // остальные: L×(1+АК)×(1+НДС)
           row.getCell(14).value = { formula: `IF(K${r}=0,0,L${r}/K${r})` };
           row.getCell(15).value = { formula: `IF(K${r}=0,0,M${r}/K${r})` };
           row.getCell(9).numFmt = "0.00%"; row.getCell(10).numFmt = "0.00%";
@@ -366,7 +373,8 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
 
       const note = ws.getRow(r + 1);
       note.getCell(1).value =
-        "Курс, АК и НДС — вводятся вручную (жёлтые ячейки B1:B3), формулы M/N/O/CTR/CR пересчитаются автоматически. " +
+        "Курс, АК, НДС и коэфф. Яндекс — вводятся вручную (жёлтые ячейки B1:B4), формулы M/N/O/CTR/CR пересчитаются автоматически. " +
+        "Расход с НДС и АК (M): Яндекс — L×коэфф.(0.95)×(1+НДС); Meta/Google/TikTok — L×(1+АК)×(1+НДС). " +
         "Google/Яндекс: модель оплаты определена по типу кампании (Поиск→CPA, YouTube→CPV) — в кабинетах эта разбивка отдельно не хранится. " +
         "Охват (G) для Google/Яндекс не заполнен — этот показатель сейчас не сохраняется в нашей базе для этих площадок (только Meta). " +
         (unclassified.size ? `Класс жилья не заполнен (жёлтым): ${[...unclassified].join(", ")}.` : "");
@@ -445,7 +453,7 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
           </button>
         </div>
         <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-          Курс — вручную, конкретно для этой выгрузки (не совпадает с авто-курсом НБ РК выше). АК и НДС применяются как формулы — их можно поменять прямо в файле.
+          Курс — вручную, конкретно для этой выгрузки (не совпадает с авто-курсом НБ РК выше). Расход с НДС и АК: Яндекс — ×0.95×(1+НДС), остальные площадки — ×(1+АК)×(1+НДС). Всё применяется формулами — можно поменять прямо в файле.
         </div>
       </div>
       <div className="table-scroll">

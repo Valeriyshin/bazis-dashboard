@@ -12,3 +12,4 @@ next-env.d.ts
 data/*.json
 data/*.html
 data/*.csv
+tsconfig.tsbuildinfo

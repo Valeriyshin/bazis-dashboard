@@ -4,6 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from "recharts";
+// exceljs — только динамически (по клику на "Скачать Excel"), иначе ~250 КБ
+// уходят в общий бандл главной страницы, хотя нужны редко.
 import {
   METRICS, METRIC_BY_KEY, DEFAULT_KPI_KEYS, DailyRow,
   sumRows, metricValue, formatMetric, delta,
@@ -92,6 +94,24 @@ const ZHK_CANON: Record<string, string> = {
   "nurlydala2": "Nurly Dala II",
 };
 
+// Класс жилья — ручные данные, в рекламных кабинетах их нет. Затравка составлена
+// по прошлым отчётам (там, где класс был реально заполнен); для новых ЖК будет
+// пусто — колонка помечается жёлтым в выгрузке для заполнения руками.
+const ZHK_CLASS_SEED: Record<string, string> = {
+  [normz("Cascade")]: "Комфорт",
+  [normz("Duman")]: "Комфорт",
+  [normz("Jan Dostar")]: "Комфорт",
+  [normz("Nurly Dala II")]: "Комфорт",
+  [normz("Satpaev")]: "Комфорт",
+  [normz("Shahristan")]: "Комфорт",
+  [normz("Auezov City Pro")]: "Комфорт",
+  [normz("Benelux")]: "Премиум",
+  [normz("Parkville")]: "Премиум",
+  [normz("Grand Monaco")]: "Бизнес",
+  [normz("Landmark Gold")]: "Бизнес",
+  [normz("Vesper")]: "Бизнес",
+};
+
 // Сегменты, которые НЕ являются ЖК: города, бренд, цели, форматы, языки.
 const NON_ZHK = new Set([
   "Алматы", "Астана", "Шымкент", "Караганда", "Актобе", "Атырау", "Almaty", "Astana", "Shymkent",
@@ -163,7 +183,12 @@ interface YCampaign { campaign_id: string; name: string; spend: number; impressi
 function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
   const [google, setGoogle] = useState<GCampaign[] | null>(null);
   const [yandex, setYandex] = useState<YCampaign[] | null>(null);
-  const [rate, setRate] = useState(500); // ₸ за $1 (эффективный за период)
+  const [rate, setRate] = useState(500); // ₸ за $1 (эффективный за период, авто по НБ РК)
+  // Выгрузка в Excel — свои ручные параметры, независимые от авто-курса выше.
+  const [exportRate, setExportRate] = useState("");
+  const [akPct, setAkPct] = useState(10);
+  const [ndsPct, setNdsPct] = useState(16);
+  const [exporting, setExporting] = useState(false);
   const [fxMonths, setFxMonths] = useState<{ month: string; rate: number; days: number }[]>([]);
   const [cols, setCols] = useState<string[]>(ZHK_DEFAULT);
   useEffect(() => {
@@ -254,6 +279,113 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
     return asc ? d : -d;
   });
 
+  // Строка выгрузки: (система, тип) → (Система, Тип кампании, Модель оплаты) под
+  // формат "Отчёт [Месяц].xlsx". Google/Яндекс не различают модель оплаты в наших
+  // данных — берём разумное соответствие по каналу (документируем допущение внизу файла).
+  const exportSysType = (sysKey: string): { system: string; type: string; model: string } => {
+    const sys = sysKey.startsWith("Google Ads") ? "Google Ads" : sysKey.startsWith("Meta") ? "Meta"
+      : sysKey.startsWith("Яндекс") ? "Яндекс" : "TikTok";
+    const label = sysKey.slice(sys.length + 1) || "—";
+    if (sys === "Meta") return { system: "Meta", type: label, model: label === "Охват" ? "CPM" : "CPL" };
+    if (sys === "Яндекс") return { system: "Яндекс", type: "Поиск", model: "CPA" };
+    if (sys === "Google Ads") return { system: "Google", type: label, model: label === "YouTube" ? "CPV" : "CPA" };
+    return { system: "TikTok", type: label, model: label === "Охват" ? "CPM" : "CPL" };
+  };
+
+  const downloadExcel = async () => {
+    const rateNum = Number(exportRate);
+    if (!rateNum || rateNum <= 0) { alert("Укажите курс доллара для выгрузки — без него нельзя перевести Meta/Google в тенге."); return; }
+    setExporting(true);
+    try {
+      const { default: ExcelJS } = await import("exceljs");
+      const wb = new ExcelJS.Workbook();
+      const monthName = new Date().toLocaleDateString("ru-RU", { month: "long" });
+      const ws = wb.addWorksheet(`Общий ${monthName}`.slice(0, 31));
+
+      // Строки 1-3 — параметры выгрузки (жёлтые, редактируются прямо в файле, формулы
+      // ниже их подхватывают через $B$1/$B$2/$B$3). Строка 4 пустая. Строка 5 — заголовок.
+      const RATE_ROW = 1, AK_ROW = 2, NDS_ROW = 3, HEADER_ROW = 5, FIRST_DATA_ROW = 6;
+      ws.getCell(`D${RATE_ROW}`).value = "Курс $ →₸ (ручной, для этой выгрузки):";
+      ws.getCell(`B${RATE_ROW}`).value = rateNum; ws.getCell(`B${RATE_ROW}`).numFmt = "0.00";
+      ws.getCell(`D${AK_ROW}`).value = "АК, %:";
+      ws.getCell(`B${AK_ROW}`).value = akPct / 100; ws.getCell(`B${AK_ROW}`).numFmt = "0%";
+      ws.getCell(`D${NDS_ROW}`).value = "НДС, %:";
+      ws.getCell(`B${NDS_ROW}`).value = ndsPct / 100; ws.getCell(`B${NDS_ROW}`).numFmt = "0%";
+      for (const row of [RATE_ROW, AK_ROW, NDS_ROW]) {
+        ws.getCell(`D${row}`).font = { bold: true, name: "Arial" };
+        ws.getCell(`B${row}`).font = { name: "Arial" };
+        ws.getCell(`B${row}`).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+      }
+
+      const headers = [
+        "ЖК", "Класс жилья", "Система", "Тип кампании", "Модель оплаты",
+        "Показы", "Охват", "Клики (все)", "CTR (все)", "CR", "Кол-во лидов",
+        "Расход без НДС и АК", "Расход с НДС и АК",
+        "Стоимость лида без НДС и АК", "Стоимость лида с НДС и АК",
+      ];
+      ws.getRow(HEADER_ROW).values = headers;
+      ws.getRow(HEADER_ROW).font = { bold: true, name: "Arial" };
+      ws.getRow(HEADER_ROW).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8E8E8" } };
+
+      let r = FIRST_DATA_ROW;
+      const unclassified = new Set<string>();
+      for (const zhk of zhks) {
+        const systems = group[zhk];
+        for (const key of Object.keys(systems).sort((x, y) => systems[y].spend - systems[x].spend)) {
+          const a = systems[key];
+          const { system, type, model } = exportSysType(key);
+          // Яндекс уже в тенге нативно — курс к нему не применяется, чтобы не искажать конвертацией туда-обратно.
+          const isYandex = system === "Яндекс";
+          const spendRaw = isYandex ? a.spendKzt : a.spend; // тенге либо исходный $ (переведём формулой)
+          const klass = ZHK_CLASS_SEED[normz(zhk)] || "";
+          if (!klass) unclassified.add(zhk);
+
+          const row = ws.getRow(r);
+          row.values = [
+            zhk, klass, system, type, model,
+            a.impressions, a.reach || null, a.clicks,
+          ];
+          row.getCell(9).value = { formula: `IF(F${r}=0,0,H${r}/F${r})` };   // CTR = клики/показы
+          row.getCell(10).value = { formula: `IF(H${r}=0,0,K${r}/H${r})` };  // CR = лиды/клики
+          row.getCell(11).value = a.leads;
+          row.getCell(12).value = isYandex ? spendRaw : { formula: `${spendRaw}*$B$${RATE_ROW}` };
+          row.getCell(13).value = { formula: `L${r}*(1+$B$${AK_ROW})*(1+$B$${NDS_ROW})` };
+          row.getCell(14).value = { formula: `IF(K${r}=0,0,L${r}/K${r})` };
+          row.getCell(15).value = { formula: `IF(K${r}=0,0,M${r}/K${r})` };
+          row.getCell(9).numFmt = "0.00%"; row.getCell(10).numFmt = "0.00%";
+          row.getCell(12).numFmt = "#,##0"; row.getCell(13).numFmt = "#,##0";
+          row.getCell(14).numFmt = "#,##0"; row.getCell(15).numFmt = "#,##0";
+          row.font = { name: "Arial" };
+          if (!klass) row.getCell(2).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+          r++;
+        }
+      }
+
+      ws.columns.forEach((col) => { col.width = 16; });
+      ws.getColumn(1).width = 20; ws.getColumn(4).width = 14;
+
+      const note = ws.getRow(r + 1);
+      note.getCell(1).value =
+        "Курс, АК и НДС — вводятся вручную (жёлтые ячейки B1:B3), формулы M/N/O/CTR/CR пересчитаются автоматически. " +
+        "Google/Яндекс: модель оплаты определена по типу кампании (Поиск→CPA, YouTube→CPV) — в кабинетах эта разбивка отдельно не хранится. " +
+        "Охват (G) для Google/Яндекс не заполнен — этот показатель сейчас не сохраняется в нашей базе для этих площадок (только Meta). " +
+        (unclassified.size ? `Класс жилья не заполнен (жёлтым): ${[...unclassified].join(", ")}.` : "");
+      note.getCell(1).font = { italic: true, size: 9, color: { argb: "FF888888" }, name: "Arial" };
+      ws.mergeCells(`A${note.number}:O${note.number}`);
+
+      const buf = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `Отчёт ${monthName}.xlsx`;
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const grand = newAgg();
   const rows: React.ReactNode[] = [];
   for (const zhk of zhks) {
@@ -291,6 +423,29 @@ function ZhkSummary({ metaCampaigns }: { metaCampaigns: Entity[] }) {
           {ZHK_COLS.map((c) => (
             <div key={c.key} className={"chip" + (cols.includes(c.key) ? " on" : "")} onClick={() => toggle(c.key)}>{c.label}</div>
           ))}
+        </div>
+      </div>
+      <div style={{ marginBottom: 14, padding: 12, border: "1px solid var(--border)", borderRadius: 8 }}>
+        <div className="panel-title" style={{ fontSize: 13 }}>Выгрузка в Excel</div>
+        <div className="controls">
+          <div className="field">
+            <label>Курс доллара, ₸</label>
+            <input type="number" placeholder="например, 480" value={exportRate} onChange={(e) => setExportRate(e.target.value)} style={{ width: 110 }} />
+          </div>
+          <div className="field">
+            <label>АК, %</label>
+            <input type="number" value={akPct} onChange={(e) => setAkPct(Number(e.target.value))} style={{ width: 70 }} />
+          </div>
+          <div className="field">
+            <label>НДС, %</label>
+            <input type="number" value={ndsPct} onChange={(e) => setNdsPct(Number(e.target.value))} style={{ width: 70 }} />
+          </div>
+          <button className="btn" onClick={downloadExcel} disabled={exporting} style={{ alignSelf: "end" }}>
+            {exporting ? "⏳ Формирую…" : "⬇ Скачать Excel"}
+          </button>
+        </div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+          Курс — вручную, конкретно для этой выгрузки (не совпадает с авто-курсом НБ РК выше). АК и НДС применяются как формулы — их можно поменять прямо в файле.
         </div>
       </div>
       <div className="table-scroll">

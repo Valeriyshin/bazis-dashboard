@@ -296,13 +296,13 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
     // Яндекс отдаёт расход в тенге — в $ переводим по среднемесячному курсу НБ РК.
     const patch = {
       impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions,
-      spend: c.spend / rate, spendKzt: c.spend, spendKztTax: c.spend * YA_TAX_COEF * (1 + nds), type: "Директ",
+      spend: c.spend / rate, spendKzt: c.spend, spendKztTax: c.spend * YA_TAX_COEF * (1 + nds), type: "Поиск",
     };
     if (isZero(patch)) continue;
-    add(resolveZhk(c.name, canon), "Яндекс", patch);
+    add(resolveZhk(c.name, canon), "Yandex Direct", patch);
   }
 
-  const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", "Яндекс": "🟡", TikTok: "⚫" };
+  const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", "Yandex Direct": "🟡", TikTok: "⚫" };
   const cell = (c: (typeof ZHK_COLS)[number], a: ZhkAgg, isType: boolean) =>
     "type" in c && c.type ? (isType ? domType(a.typeSpend) : "—") : (c as { get: (a: ZhkAgg) => number; fmt: (n: number) => string }).fmt((c as { get: (a: ZhkAgg) => number }).get(a));
 
@@ -323,12 +323,13 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
   // данных — берём разумное соответствие по каналу (документируем допущение внизу файла).
   const exportSysType = (sysKey: string): { system: string; type: string; model: string } => {
     const sys = sysKey.startsWith("Google Ads") ? "Google Ads" : sysKey.startsWith("Meta") ? "Meta"
-      : sysKey.startsWith("Яндекс") ? "Яндекс" : "TikTok";
+      : sysKey.startsWith("Yandex Direct") ? "Yandex Direct" : "TikTok";
     const label = sysKey.slice(sys.length + 1) || "—";
     if (sys === "Meta") return { system: "Meta", type: label, model: label === "Охват" ? "CPM" : "CPL" };
-    if (sys === "Яндекс") return { system: "Яндекс", type: "Поиск", model: "CPA" };
-    if (sys === "Google Ads") return { system: "Google", type: label, model: label === "YouTube" ? "CPV" : "CPA" };
-    return { system: "TikTok", type: label, model: label === "Охват" ? "CPM" : "CPL" };
+    if (sys === "Yandex Direct") return { system: "Yandex Direct", type: "Поиск", model: "CPA" };
+    if (sys === "Google Ads") return { system: "Google Ads", type: label, model: label === "YouTube" ? "CPV" : "CPA" };
+    const tkLabel = label === "Лиды" ? "Лидген формы" : label;
+    return { system: "TikTok", type: tkLabel, model: label === "Охват" ? "CPM" : "CPL" };
   };
 
   const downloadExcel = async () => {
@@ -379,7 +380,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
           const a = systems[key];
           const { system, type, model } = exportSysType(key);
           // Яндекс уже в тенге нативно — курс к нему не применяется, чтобы не искажать конвертацией туда-обратно.
-          const isYandex = system === "Яндекс";
+          const isYandex = system === "Yandex Direct";
           const spendRaw = isYandex ? a.spendKzt : a.spend; // тенге либо исходный $ (переведём формулой)
           const klass = ZHK_CLASS_SEED[normz(zhk)] || "";
           if (!klass) unclassified.add(zhk);
@@ -441,8 +442,9 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
     for (const key of Object.keys(systems).sort((x, y) => systems[y].spend - systems[x].spend)) {
       const a = systems[key];
       const sys = key.startsWith("Google Ads") ? "Google Ads" : key.startsWith("Meta") ? "Meta"
-        : key.startsWith("Яндекс") ? "Яндекс" : "TikTok";
-      const typeLabel = key.slice(sys.length + 1) || "—";
+        : key.startsWith("Yandex Direct") ? "Yandex Direct" : "TikTok";
+      const rawLabel = key.slice(sys.length + 1) || "—";
+      const typeLabel = sys === "TikTok" && rawLabel === "Лиды" ? "Лидген формы" : rawLabel;
       sub.impressions += a.impressions; sub.reach += a.reach; sub.clicks += a.clicks; sub.leads += a.leads; sub.spend += a.spend; sub.spendKzt += a.spendKzt; sub.spendKztTax += a.spendKztTax;
       rows.push(
         <tr key={zhk + key}>

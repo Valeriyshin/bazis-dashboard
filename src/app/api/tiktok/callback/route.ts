@@ -2,19 +2,47 @@ import { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
 
+const esc = (s: string) => s.replace(/[<>&]/g, "");
+
 // Публичная страница-приёмник кода авторизации TikTok.
-// TikTok редиректит сюда с ?auth_code=... — показываем код, чтобы его можно было скопировать.
+// TikTok редиректит сюда с ?auth_code=... — сразу меняем код на access_token
+// (TikTok Marketing API: POST /open_api/v1.3/oauth2/access_token/).
 export async function GET(req: NextRequest) {
   const code = req.nextUrl.searchParams.get("auth_code") || req.nextUrl.searchParams.get("code");
   const err = req.nextUrl.searchParams.get("message");
 
-  const body = code
-    ? `<h1>Код авторизации TikTok получен</h1>
-       <p>Скопируйте его и передайте для обмена на access token:</p>
-       <div class="code">${code.replace(/[<>&]/g, "")}</div>
-       <p class="muted">Код одноразовый и действует недолго — используйте сразу.</p>`
-    : `<h1>Код не получен</h1>
-       <p class="muted">${err ? err.replace(/[<>&]/g, "") : "TikTok не передал auth_code. Попробуйте авторизацию ещё раз."}</p>`;
+  let body: string;
+  if (!code) {
+    body = `<h1>Код не получен</h1>
+       <p class="muted">${err ? esc(err) : "TikTok не передал auth_code. Попробуйте авторизацию ещё раз."}</p>`;
+  } else {
+    try {
+      const res = await fetch("https://business-api.tiktok.com/open_api/v1.3/oauth2/access_token/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          app_id: process.env.TIKTOK_APP_ID,
+          secret: process.env.TIKTOK_APP_SECRET,
+          auth_code: code,
+        }),
+      });
+      const j = await res.json();
+      if (j.code !== 0 || !j.data?.access_token) {
+        body = `<h1>Не удалось обменять код на токен</h1>
+           <p class="muted">${esc(JSON.stringify(j).slice(0, 500))}</p>`;
+      } else {
+        const advIds = (j.data.advertiser_ids || []).join(", ");
+        body = `<h1>Доступ к TikTok получен</h1>
+           <p>Access token (долгоживущий, ~24 месяца):</p>
+           <div class="code">${esc(j.data.access_token)}</div>
+           <p>Advertiser ID(ы):</p>
+           <div class="code">${esc(advIds || "—")}</div>
+           <p class="muted">Скопируйте оба значения и передайте для сохранения в конфиг.</p>`;
+      }
+    } catch (e) {
+      body = `<h1>Ошибка обмена кода</h1><p class="muted">${esc((e as Error).message)}</p>`;
+    }
+  }
 
   return new Response(
     `<!doctype html><html lang="ru"><head><meta charset="utf-8">

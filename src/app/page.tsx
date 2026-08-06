@@ -26,7 +26,7 @@ interface ApiData {
   summary: { author: string; created_at: string; data: SummaryData | null } | null;
 }
 
-const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "Сводка"] as const;
+const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "TikTok", "Сводка"] as const;
 type Tab = (typeof TABS)[number];
 const LINE_COLORS = ["#4f8cff", "#34d399", "#f59e0b", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#facc15", "#60a5fa", "#4ade80", "#fb923c"];
 
@@ -74,6 +74,7 @@ export default function Page() {
       {tab === "Сводка" && <Summary summary={data.summary} />}
       {tab === "Google Ads" && <GoogleAds metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} />}
       {tab === "Яндекс" && <YandexAds />}
+      {tab === "TikTok" && <TiktokAds />}
     </div>
   );
 }
@@ -122,6 +123,7 @@ const NON_ZHK = new Set([
   "ThruPlay", "Thruplay", "Просмотры Thruplay", "Просмотры", "Охват SMM", "SMM",
   "Трафик", "Конверсии", "Продажи", "Сообщения", "Установки",
   "YT Shorts", "YT InStream", "YouTube Multiple Formats", "Adv", "Adv+", "Wide", "LAL",
+  "Летние Скидки", "Коммерция", "Smart+", "TT", "4 города", "3 города", "2 города",
 ].map(normz));
 
 // Содержательные сегменты названия (кандидаты на ЖК): без кода кампании, города, бренда, цели.
@@ -130,6 +132,7 @@ function zhkCandidates(name: string): string[] {
     const n = normz(s);
     if (!n || NON_ZHK.has(n)) return false;
     if (/^#?\d+$/.test(s.trim())) return false; // "#2", "1"
+    if (/^\d{1,2}\.\d{1,2}$/.test(s.trim())) return false; // "05.08" (дата в названии)
     if (/^(cpa|cpl|cpm|cpv|cpc|cpe)\d*$/.test(n)) return false; // "CPA", "CPA #2" → cpa2
     return true;
   });
@@ -181,6 +184,7 @@ const ZHK_COLS = [
 const ZHK_DEFAULT = ["type", "impressions", "reach", "clicks", "ctr", "leads", "cpl", "spend", "spendKzt", "spendKztTax", "cplKztTax"];
 
 interface YCampaign { campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
+interface TCampaign { campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
 
 // Кампании, которые бьём не по ЖК, а по городам (группам объявлений) — это
 // сквозные акции на несколько городов сразу, у них нет единого ЖК-названия.
@@ -190,6 +194,7 @@ const CITY_LIST = ["Алматы", "Астана", "Шымкент", "Атыра
 function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; metaAdsets: Entity[] }) {
   const [google, setGoogle] = useState<GCampaign[] | null>(null);
   const [yandex, setYandex] = useState<YCampaign[] | null>(null);
+  const [tiktok, setTiktok] = useState<TCampaign[] | null>(null);
   const [rate, setRate] = useState(500); // ₸ за $1 (эффективный за период, авто по НБ РК)
   // Выгрузка в Excel — свои ручные параметры, независимые от авто-курса выше.
   const [exportRate, setExportRate] = useState("");
@@ -206,6 +211,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
       if (d.rate) setRate(d.rate);
       if (d.fxMonths) setFxMonths(d.fxMonths);
     }).catch(() => setYandex([]));
+    fetch("/api/tiktok").then((r) => r.json()).then((d) => setTiktok(d.error ? [] : d.campaigns)).catch(() => setTiktok([]));
   }, []);
   const [sortKey, setSortKey] = useState<string>("spend");
   const [asc, setAsc] = useState(false);
@@ -300,6 +306,16 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
     };
     if (isZero(patch)) continue;
     add(resolveZhk(c.name, canon), "Yandex Direct", patch);
+  }
+  for (const c of tiktok ?? []) {
+    const spend = c.spend; // кабинет в USD
+    const type = /лиды/i.test(c.name) ? "Лидген формы" : /охват/i.test(c.name) ? "Охват" : "—";
+    const patch = {
+      impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions,
+      spend, spendKzt: spend * rate, spendKztTax: spend * taxRate * (1 + ak) * (1 + nds), type,
+    };
+    if (isZero(patch)) continue;
+    add(resolveZhk(c.name, canon), "TikTok", patch);
   }
 
   const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", "Yandex Direct": "🟡", TikTok: "⚫" };
@@ -517,10 +533,10 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
         </table>
       </div>
       <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
-        ЖК определяется по названию кампании. «Лиды»: Meta — лид-формы, Google и Яндекс — конверсии. Охват отдаёт только Meta (—).
+        ЖК определяется по названию кампании. «Лиды»: Meta — лид-формы, Google и Яндекс — конверсии, TikTok — лидген формы. Охват отдаёт только Meta (—).
         <br />Курс ₸/$ — среднемесячный по данным Нацбанка РК, за период <b>{rate}</b>
         {fxMonths.length > 0 && <> ({fxMonths.map((m) => `${m.month}: ${m.rate}`).join(", ")})</>}.
-        Meta и Google приходят в $, Яндекс — в ₸. TikTok подключим отдельно.
+        Meta, Google и TikTok приходят в $, Яндекс — в ₸.
       </div>
     </div>
   );
@@ -884,6 +900,107 @@ function YandexAds() {
           </table>
         </div>
         <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>Суммы в тенге. Курс для сводки по ЖК: {y.rate} ₸ за $1.</div>
+      </div>
+    </>
+  );
+}
+
+/* ============ TikTok Ads ============ */
+interface TData {
+  snapshot: { advertiser_id: string; period_start: string; period_end: string; currency: string };
+  daily: { date: string; spend: number; impressions: number; clicks: number; conversions: number }[];
+  campaigns: (TCampaign & { ctr: number; cost_per_conversion: number; status: string })[];
+}
+function TiktokAds() {
+  const [t, setT] = useState<TData | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [metric, setMetric] = useState<"spend" | "clicks" | "conversions" | "impressions">("spend");
+  const [sortKey, setSortKey] = useState<string>("spend");
+  const [asc, setAsc] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/tiktok").then((r) => r.json()).then((d) => { d.error ? setErr(d.error) : setT(d); }).catch((e) => setErr(String(e)));
+  }, []);
+
+  if (err) return <div className="panel err">Ошибка: {err}<div className="muted" style={{ marginTop: 8 }}>Запустите <code>npm run sync:tiktok</code>.</div></div>;
+  if (!t) return <div className="center muted">Загрузка TikTok…</div>;
+
+  const T = t.daily.reduce((a, r) => ({ spend: a.spend + r.spend, impressions: a.impressions + r.impressions, clicks: a.clicks + r.clicks, conversions: a.conversions + r.conversions }), { spend: 0, impressions: 0, clicks: 0, conversions: 0 });
+  const money = (n: number) => "$" + n.toLocaleString("ru-RU", { maximumFractionDigits: n < 100 ? 2 : 0 });
+  const int = (n: number) => Math.round(n).toLocaleString("ru-RU");
+  const cpa = T.conversions ? T.spend / T.conversions : 0;
+  const ctr = T.impressions ? (T.clicks / T.impressions) * 100 : 0;
+  const cpc = T.clicks ? T.spend / T.clicks : 0;
+
+  const kpis = [
+    { l: "Расход", v: money(T.spend) }, { l: "Лидген формы", v: int(T.conversions) }, { l: "CPA", v: money(cpa) },
+    { l: "Клики", v: int(T.clicks) }, { l: "CTR", v: ctr.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" },
+    { l: "CPC", v: money(cpc) }, { l: "Показы", v: int(T.impressions) },
+  ];
+  const METR = [{ k: "spend", l: "Расход" }, { k: "conversions", l: "Лидген формы" }, { k: "clicks", l: "Клики" }, { k: "impressions", l: "Показы" }] as const;
+  const chart = t.daily.map((r) => ({ date: new Date(r.date).toLocaleDateString("ru-RU", { day: "2-digit", month: "short" }), value: r[metric] }));
+
+  const COLS = [
+    { k: "spend", l: "Расход", f: money }, { k: "conversions", l: "Лидген формы", f: int },
+    { k: "cost_per_conversion", l: "CPA", f: money }, { k: "clicks", l: "Клики", f: int },
+    { k: "ctr", l: "CTR", f: (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" },
+    { k: "impressions", l: "Показы", f: int },
+  ];
+  const sorted = [...t.campaigns].sort((a, b) => {
+    const av = (a as unknown as Record<string, number>)[sortKey], bv = (b as unknown as Record<string, number>)[sortKey];
+    return asc ? av - bv : bv - av;
+  });
+  const setSort = (k: string) => { if (k === sortKey) setAsc(!asc); else { setSortKey(k); setAsc(false); } };
+
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-title">
+          TikTok{t.snapshot.advertiser_id ? ` · ${t.snapshot.advertiser_id}` : ""} · {new Date(t.snapshot.period_start).toLocaleDateString("ru-RU")} — {new Date(t.snapshot.period_end).toLocaleDateString("ru-RU")}
+        </div>
+        <div className="kpi-grid">
+          {kpis.map((k) => (<div className="kpi" key={k.l}><div className="label">{k.l}</div><div className="value">{k.v}</div></div>))}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="controls">
+          <div className="field"><label>Метрика графика</label>
+            <select value={metric} onChange={(e) => setMetric(e.target.value as typeof metric)}>
+              {METR.map((m) => <option key={m.k} value={m.k}>{m.l}</option>)}
+            </select>
+          </div>
+        </div>
+        <ResponsiveContainer width="100%" height={340}>
+          <LineChart data={chart} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
+            <CartesianGrid stroke="#263042" strokeDasharray="3 3" />
+            <XAxis dataKey="date" stroke="#8b95a7" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
+            <YAxis stroke="#8b95a7" fontSize={11} width={70} />
+            <Tooltip contentStyle={{ background: "#141925", border: "1px solid #263042", borderRadius: 10, color: "#e6e9ef" }} />
+            <Line type="monotone" dataKey="value" stroke="#22d3ee" strokeWidth={2} dot={false} name={METR.find((m) => m.k === metric)?.l} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="panel">
+        <div className="panel-title">Кампании TikTok ({t.campaigns.length})</div>
+        <div className="table-scroll">
+          <table>
+            <thead><tr>
+              <th>Кампания</th>
+              {COLS.map((c) => <th key={c.k} onClick={() => setSort(c.k)} style={{ cursor: "pointer" }}>{c.l}{sortKey === c.k ? (asc ? " ▲" : " ▼") : ""}</th>)}
+            </tr></thead>
+            <tbody>
+              {sorted.map((c) => (
+                <tr key={c.campaign_id}>
+                  <td title={c.name} style={{ maxWidth: 340, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</td>
+                  {COLS.map((col) => <td key={col.k}>{col.f((c as unknown as Record<string, number>)[col.k])}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>Суммы в долларах (кабинет в USD). &quot;Лидген формы&quot; — конверсии по цели кампании в TikTok Ads.</div>
       </div>
     </>
   );

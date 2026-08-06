@@ -23,6 +23,8 @@ jobs:
       GOOGLE_ADS_REFRESH_TOKEN: ${{ secrets.GOOGLE_ADS_REFRESH_TOKEN }}
       YANDEX_OAUTH_TOKEN: ${{ secrets.YANDEX_OAUTH_TOKEN }}
       YANDEX_CURRENCY: KZT
+      TIKTOK_ACCESS_TOKEN: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+      TIKTOK_ADVERTISER_IDS: ${{ secrets.TIKTOK_ADVERTISER_IDS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,4 +46,8 @@ jobs:
 
       - name: Яндекс.Директ
         run: npm run sync:yandex
+        continue-on-error: true
+
+      - name: TikTok
+        run: npm run sync:tiktok
         continue-on-error: true

@@ -18,7 +18,7 @@ function db() {
   return createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN });
 }
 
-const GA_API = "https://googleads.googleapis.com/v21";
+const GA_API = "https://googleads.googleapis.com/v22";
 const num = (v) => (v == null || v === "" ? 0 : Number(v));
 const micros = (v) => num(v) / 1e6;
 

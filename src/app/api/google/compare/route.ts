@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
-const GA_API = "https://googleads.googleapis.com/v21";
+const GA_API = "https://googleads.googleapis.com/v22";
 const num = (v: unknown) => (v == null || v === "" ? 0 : Number(v));
 const micros = (v: unknown) => num(v) / 1e6;
 

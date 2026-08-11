@@ -54,6 +54,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS tiktok_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, advertiser_id TEXT, created_at TEXT, period_start TEXT, period_end TEXT, currency TEXT DEFAULT 'USD')`,
   `CREATE TABLE IF NOT EXISTS tiktok_daily (snapshot_id INTEGER, date TEXT, spend REAL, impressions INTEGER, clicks INTEGER, conversions REAL, PRIMARY KEY (snapshot_id, date))`,
   `CREATE TABLE IF NOT EXISTS tiktok_campaigns (snapshot_id INTEGER, campaign_id TEXT, name TEXT, status TEXT, spend REAL, impressions INTEGER, clicks INTEGER, ctr REAL, conversions REAL, cost_per_conversion REAL, PRIMARY KEY (snapshot_id, campaign_id))`,
+  `CREATE TABLE IF NOT EXISTS tiktok_adgroups (snapshot_id INTEGER, adgroup_id TEXT, campaign_id TEXT, name TEXT, spend REAL, impressions INTEGER, clicks INTEGER, ctr REAL, conversions REAL, cost_per_conversion REAL, PRIMARY KEY (snapshot_id, adgroup_id))`,
 ];
 
 function dateRange(days) {
@@ -188,6 +189,27 @@ export async function runTiktokSync(opts = {}) {
     }
   }
 
+  // Группы объявлений — тем же коротким окном, что и кампании: нужны, чтобы разбить
+  // сквозные акции (Summer Fest и т.п.) по городам, как уже сделано для Meta/Google.
+  const adgroups = [];
+  for (const adv of ADVS) {
+    const rows = await report(adv, "AUCTION_ADGROUP", ["adgroup_id"],
+      ["adgroup_name", "campaign_id", "spend", "impressions", "clicks", "conversion"], sinceEntity, until);
+    for (const r of rows) {
+      const spend = num(r.metrics.spend);
+      const conversions = num(r.metrics.conversion);
+      adgroups.push({
+        id: `${adv}:${r.dimensions.adgroup_id}`,
+        campaignId: `${adv}:${r.metrics.campaign_id}`,
+        name: r.metrics.adgroup_name,
+        spend, impressions: num(r.metrics.impressions), clicks: num(r.metrics.clicks),
+        ctr: num(r.metrics.impressions) ? (num(r.metrics.clicks) / num(r.metrics.impressions)) * 100 : 0,
+        conversions,
+        cost_per_conversion: conversions ? spend / conversions : 0,
+      });
+    }
+  }
+
   const now = new Date().toISOString();
   const snap = await conn.execute({
     sql: "INSERT INTO tiktok_snapshots (advertiser_id, created_at, period_start, period_end, currency) VALUES (?,?,?,?,?)",
@@ -198,11 +220,12 @@ export async function runTiktokSync(opts = {}) {
   const stmts = [];
   for (const r of daily) stmts.push({ sql: "INSERT INTO tiktok_daily (snapshot_id,date,spend,impressions,clicks,conversions) VALUES (?,?,?,?,?,?)", args: [snapId, r.date, r.spend, r.impressions, r.clicks, r.conversions] });
   for (const r of camps) stmts.push({ sql: "INSERT INTO tiktok_campaigns (snapshot_id,campaign_id,name,status,spend,impressions,clicks,ctr,conversions,cost_per_conversion) VALUES (?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.name, r.status, r.spend, r.impressions, r.clicks, r.ctr, r.conversions, r.cost_per_conversion] });
+  for (const r of adgroups) stmts.push({ sql: "INSERT INTO tiktok_adgroups (snapshot_id,adgroup_id,campaign_id,name,spend,impressions,clicks,ctr,conversions,cost_per_conversion) VALUES (?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.campaignId, r.name, r.spend, r.impressions, r.clicks, r.ctr, r.conversions, r.cost_per_conversion] });
   if (stmts.length) await conn.batch(stmts, "write");
 
   return {
     snapshotId: snapId, since: sinceEntity, until,
-    days: daily.filter((r) => r.date >= sinceEntity).length, campaigns: camps.length,
+    days: daily.filter((r) => r.date >= sinceEntity).length, campaigns: camps.length, adgroups: adgroups.length,
     dailyHistorySince: since, dailyHistoryDays: daily.length,
   };
 }

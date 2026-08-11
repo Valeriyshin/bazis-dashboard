@@ -234,6 +234,7 @@ const ZHK_DEFAULT = ["type", "impressions", "reach", "clicks", "ctr", "leads", "
 
 interface YCampaign { campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
 interface TCampaign { campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
+interface TAdgroup { adgroup_id: string; campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
 interface GAdgroup { ad_group_id: string; campaign_id: string; name: string; spend: number; impressions: number; clicks: number; ctr: number; conversions: number; cost_per_conversion: number }
 
 // Кампании, которые бьём не по ЖК, а по городам (группам объявлений) — это
@@ -249,6 +250,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
   const [googleAdgroups, setGoogleAdgroups] = useState<GAdgroup[]>([]);
   const [yandex, setYandex] = useState<YCampaign[] | null>(null);
   const [tiktok, setTiktok] = useState<TCampaign[] | null>(null);
+  const [tiktokAdgroups, setTiktokAdgroups] = useState<TAdgroup[]>([]);
   const [rate, setRate] = useState(500); // ₸ за $1 (эффективный за период, авто по НБ РК)
   // Выгрузка в Excel — свои ручные параметры, независимые от авто-курса выше.
   const [exportRate, setExportRate] = useState("");
@@ -277,6 +279,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
     }).catch(() => setYandex([]));
     fetch("/api/tiktok").then((r) => r.json()).then((d) => {
       setTiktok(d.error ? [] : d.campaigns);
+      setTiktokAdgroups(d.error ? [] : (d.adgroups ?? []));
       setPeriods((p) => ({ ...p, TikTok: d.snapshot ? { start: d.snapshot.period_start, end: d.snapshot.period_end } : null }));
     }).catch(() => setTiktok([]));
   }, []);
@@ -419,6 +422,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
     add(resolveZhk(c.name, canon), "Yandex Direct", patch);
   }
   for (const c of tiktok ?? []) {
+    if (MULTICITY_RE.test(c.name)) continue; // эти кампании бьём ниже по городам (ad group)
     const spend = c.spend; // кабинет в USD
     const type = /лиды/i.test(c.name) ? "Лидген формы" : /охват/i.test(c.name) ? "Охват" : "—";
     const patch = {
@@ -427,6 +431,28 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
     };
     if (isZero(patch)) continue;
     add(resolveZhk(c.name, canon), "TikTok", patch);
+  }
+  {
+    // TikTok: сквозные акции (Коммерция / Летние скидки / Summer Fest) — бьём по городам
+    // из названий групп объявлений, как и у Meta.
+    const multiIds = new Set((tiktok ?? []).filter((c) => MULTICITY_RE.test(c.name)).map((c) => c.campaign_id));
+    const campById = new Map((tiktok ?? []).map((c) => [c.campaign_id, c]));
+    for (const ag of tiktokAdgroups) {
+      if (!multiIds.has(ag.campaign_id)) continue;
+      const camp = campById.get(ag.campaign_id);
+      if (!camp) continue;
+      const label = /летние\s*скидк/i.test(camp.name) ? "Летние скидки"
+        : /summer\s*fest/i.test(camp.name) ? "Summer Fest" : "Коммерция";
+      const city = CITY_LIST.find((ct) => ag.name.includes(ct)) || "Прочее";
+      const type = /лиды/i.test(camp.name) ? "Лидген формы" : /охват/i.test(camp.name) ? "Охват" : "—";
+      const spend = ag.spend;
+      const patch = {
+        impressions: ag.impressions, reach: 0, clicks: ag.clicks, leads: ag.conversions,
+        spend, spendKzt: spend * rate, spendKztTax: spend * taxRate * (1 + ak) * (1 + nds), type,
+      };
+      if (isZero(patch)) continue;
+      add(`${label} · ${city}`, "TikTok", patch);
+    }
   }
 
   const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", "Yandex Direct": "🟡", TikTok: "⚫" };

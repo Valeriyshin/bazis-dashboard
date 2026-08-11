@@ -8,6 +8,7 @@ export function runTiktokSync(opts?: {
   until: string;
   days: number;
   campaigns: number;
+  adgroups: number;
   dailyHistorySince: string;
   dailyHistoryDays: number;
 }>;

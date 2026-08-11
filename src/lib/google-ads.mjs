@@ -63,6 +63,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS google_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id TEXT, created_at TEXT, period_start TEXT, period_end TEXT, currency TEXT DEFAULT 'USD')`,
   `CREATE TABLE IF NOT EXISTS google_daily (snapshot_id INTEGER, date TEXT, spend REAL, impressions INTEGER, clicks INTEGER, conversions REAL, PRIMARY KEY (snapshot_id, date))`,
   `CREATE TABLE IF NOT EXISTS google_campaigns (snapshot_id INTEGER, campaign_id TEXT, name TEXT, status TEXT, channel TEXT, spend REAL, impressions INTEGER, clicks INTEGER, ctr REAL, cpc REAL, conversions REAL, cost_per_conversion REAL, PRIMARY KEY (snapshot_id, campaign_id))`,
+  `CREATE TABLE IF NOT EXISTS google_adgroups (snapshot_id INTEGER, ad_group_id TEXT, campaign_id TEXT, name TEXT, spend REAL, impressions INTEGER, clicks INTEGER, ctr REAL, conversions REAL, cost_per_conversion REAL, PRIMARY KEY (snapshot_id, ad_group_id))`,
 ];
 
 function dateRange(days) {
@@ -183,6 +184,25 @@ export async function runGoogleAdsSync(opts = {}) {
     cost_per_conversion: micros(r.metrics.costPerConversion),
   }));
 
+  // Группы объявлений — тем же (коротким) окном, что и кампании: нужны, чтобы
+  // разбить "сборные" кампании (HUB, Бренд/Общие поиск) по ЖК, у которых в названии
+  // самой кампании ЖК не виден, а в названии группы объявлений — виден ("Бренд | PARKVILLE").
+  const adgroupRows = await gaql(token, cid, login,
+    `SELECT ad_group.id, ad_group.name, campaign.id,
+            metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.ctr, metrics.conversions, metrics.cost_per_conversion
+     FROM ad_group WHERE segments.date BETWEEN '${sinceEntity}' AND '${until}'`);
+  const adgroups = adgroupRows.map((r) => ({
+    id: String(r.adGroup.id),
+    campaignId: String(r.campaign.id),
+    name: r.adGroup.name,
+    spend: micros(r.metrics.costMicros),
+    impressions: num(r.metrics.impressions),
+    clicks: num(r.metrics.clicks),
+    ctr: num(r.metrics.ctr) * 100,
+    conversions: num(r.metrics.conversions),
+    cost_per_conversion: micros(r.metrics.costPerConversion),
+  }));
+
   const now = new Date().toISOString();
   const snap = await conn.execute({
     sql: "INSERT INTO google_snapshots (customer_id, created_at, period_start, period_end, currency) VALUES (?,?,?,?,?)",
@@ -193,11 +213,12 @@ export async function runGoogleAdsSync(opts = {}) {
   const stmts = [];
   for (const r of daily) stmts.push({ sql: "INSERT INTO google_daily (snapshot_id,date,spend,impressions,clicks,conversions) VALUES (?,?,?,?,?,?)", args: [snapId, r.date, r.spend, r.impressions, r.clicks, r.conversions] });
   for (const r of camps) stmts.push({ sql: "INSERT INTO google_campaigns (snapshot_id,campaign_id,name,status,channel,spend,impressions,clicks,ctr,cpc,conversions,cost_per_conversion) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.name, r.status, r.channel, r.spend, r.impressions, r.clicks, r.ctr, r.cpc, r.conversions, r.cost_per_conversion] });
+  for (const r of adgroups) stmts.push({ sql: "INSERT INTO google_adgroups (snapshot_id,ad_group_id,campaign_id,name,spend,impressions,clicks,ctr,conversions,cost_per_conversion) VALUES (?,?,?,?,?,?,?,?,?,?)", args: [snapId, r.id, r.campaignId, r.name, r.spend, r.impressions, r.clicks, r.ctr, r.conversions, r.cost_per_conversion] });
   if (stmts.length) await conn.batch(stmts, "write");
 
   return {
     snapshotId: snapId, since: sinceEntity, until,
-    days: daily.filter((r) => r.date >= sinceEntity).length, campaigns: camps.length,
+    days: daily.filter((r) => r.date >= sinceEntity).length, campaigns: camps.length, adgroups: adgroups.length,
     dailyHistorySince: since, dailyHistoryDays: daily.length,
   };
 }

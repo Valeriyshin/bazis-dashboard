@@ -125,6 +125,7 @@ const NON_ZHK = new Set([
   "Трафик", "Конверсии", "Продажи", "Сообщения", "Установки",
   "YT Shorts", "YT InStream", "YouTube Multiple Formats", "Adv", "Adv+", "Wide", "LAL",
   "Летние Скидки", "Коммерция", "Smart+", "TT", "4 города", "3 города", "2 города",
+  "IG", "IG+FB", "FB", "AstAud", "База Аст", "Бренд",
 ].map(normz));
 
 // Содержательные сегменты названия (кандидаты на ЖК): без кода кампании, города, бренда, цели.
@@ -186,14 +187,19 @@ const ZHK_DEFAULT = ["type", "impressions", "reach", "clicks", "ctr", "leads", "
 
 interface YCampaign { campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
 interface TCampaign { campaign_id: string; name: string; spend: number; impressions: number; clicks: number; conversions: number }
+interface GAdgroup { ad_group_id: string; campaign_id: string; name: string; spend: number; impressions: number; clicks: number; ctr: number; conversions: number; cost_per_conversion: number }
 
 // Кампании, которые бьём не по ЖК, а по городам (группам объявлений) — это
 // сквозные акции на несколько городов сразу, у них нет единого ЖК-названия.
 const MULTICITY_RE = /коммерц|летние\s*скидк/i;
 const CITY_LIST = ["Алматы", "Астана", "Шымкент", "Атырау", "Караганда", "Актобе"];
+// HUB-кампании (Meta и Google) — сборные по нескольким ЖК сразу, ЖК виден только на
+// уровне группы объявлений (Meta: адсет, Google: ad group), а не в названии кампании.
+const HUB_RE = /\bhub\b/i;
 
 function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: Entity[]; metaAdsets: Entity[]; metaPeriod: { start: string; end: string } }) {
   const [google, setGoogle] = useState<GCampaign[] | null>(null);
+  const [googleAdgroups, setGoogleAdgroups] = useState<GAdgroup[]>([]);
   const [yandex, setYandex] = useState<YCampaign[] | null>(null);
   const [tiktok, setTiktok] = useState<TCampaign[] | null>(null);
   const [rate, setRate] = useState(500); // ₸ за $1 (эффективный за период, авто по НБ РК)
@@ -212,6 +218,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
   useEffect(() => {
     fetch("/api/google").then((r) => r.json()).then((d) => {
       setGoogle(d.error ? [] : d.campaigns);
+      setGoogleAdgroups(d.error ? [] : (d.adgroups ?? []));
       setPeriods((p) => ({ ...p, "Google Ads": d.snapshot ? { start: d.snapshot.period_start, end: d.snapshot.period_end } : null }));
     }).catch(() => setGoogle([]));
     fetch("/api/yandex").then((r) => r.json()).then((d) => {
@@ -258,8 +265,11 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
     if (patch.type) a.typeSpend[patch.type] = (a.typeSpend[patch.type] ?? 0) + (patch.spend ?? 0);
   };
   // Каноничные ЖК: сначала из Meta (стабильный нейминг), затем дополняются из Google.
+  // HUB/Коммерция/Летние скидки — сборные кампании без единого ЖК, их не сеем в canon
+  // (иначе "HUB" зарегистрируется как fake-ЖК ещё до того, как мы её разберём по адсетам).
   const canon = new Map<string, string>();
   for (const c of metaCampaigns) {
+    if (MULTICITY_RE.test(c.name) || HUB_RE.test(c.name)) continue;
     const cs = zhkCandidates(c.name);
     if (cs.length) { const k = normz(cs[0]); if (!canon.has(k)) canon.set(k, cs[0]); }
   }
@@ -267,7 +277,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
     !(p.impressions || 0) && !(p.spend || 0) && !(p.clicks || 0) && !(p.leads || 0);
 
   for (const c of metaCampaigns) {
-    if (MULTICITY_RE.test(c.name)) continue; // эти кампании бьём ниже по городам (адсетам)
+    if (MULTICITY_RE.test(c.name) || HUB_RE.test(c.name)) continue; // эти кампании бьём ниже по адсетам
     const cc = c as unknown as Record<string, number | string>;
     const spend = +cc.spend;
     const patch = {
@@ -302,15 +312,54 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
       add(`${label} · ${city}`, "Meta", patch);
     }
   }
-  for (const c of google ?? []) {
-    const gc = c as unknown as Record<string, unknown>;
-    const patch = {
-      impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions,
-      spend: c.spend, spendKzt: c.spend * rate, spendKztTax: c.spend * taxRate * (1 + ak) * (1 + nds),
-      type: (gc.channel as string) || "—",
-    };
-    if (isZero(patch)) continue;
-    add(resolveZhk(c.name, canon), "Google Ads", patch);
+  {
+    // HUB-кампании Meta (сборные по нескольким ЖК) — бьём по адсетам: ЖК определяется
+    // по названию адсета (последний сегмент), а не кампании.
+    const hubCampaignIds = new Set(metaCampaigns.filter((c) => HUB_RE.test(c.name)).map((c) => c.campaign_id));
+    for (const a of metaAdsets) {
+      if (!a.campaign_id || !hubCampaignIds.has(a.campaign_id)) continue;
+      const ac = a as unknown as Record<string, number | string>;
+      const spend = +ac.spend;
+      const patch = {
+        impressions: +ac.impressions, reach: +ac.reach, clicks: +ac.clicks,
+        leads: ac.result_type === "Лиды" ? +ac.results : 0,
+        spend, spendKzt: spend * rate, spendKztTax: spend * taxRate * (1 + ak) * (1 + nds),
+        type: (ac.result_type as string) || "—",
+      };
+      if (isZero(patch)) continue;
+      add(resolveZhk(a.name, canon), "Meta", patch);
+    }
+  }
+  {
+    // Google: кампании, где сам названием кампании ЖК не выдаёт (HUB-кампании или
+    // "Бренд/Общий поиск" без содержательного сегмента) — бьём по группам объявлений
+    // ("Бренд | PARKVILLE"), там ЖК виден напрямую.
+    const googleSplitIds = new Set(
+      (google ?? []).filter((c) => HUB_RE.test(c.name) || zhkCandidates(c.name).length === 0).map((c) => c.campaign_id)
+    );
+    const googleChannelById = new Map((google ?? []).map((c) => [c.campaign_id, (c as unknown as Record<string, unknown>).channel as string]));
+    for (const c of google ?? []) {
+      if (googleSplitIds.has(c.campaign_id)) continue;
+      const gc = c as unknown as Record<string, unknown>;
+      const patch = {
+        impressions: c.impressions, reach: 0, clicks: c.clicks, leads: c.conversions,
+        spend: c.spend, spendKzt: c.spend * rate, spendKztTax: c.spend * taxRate * (1 + ak) * (1 + nds),
+        type: (gc.channel as string) || "—",
+      };
+      if (isZero(patch)) continue;
+      add(resolveZhk(c.name, canon), "Google Ads", patch);
+    }
+    for (const ag of googleAdgroups) {
+      if (!googleSplitIds.has(ag.campaign_id)) continue;
+      const spend = ag.spend;
+      const patch = {
+        impressions: ag.impressions, reach: 0, clicks: ag.clicks, leads: ag.conversions,
+        spend, spendKzt: spend * rate, spendKztTax: spend * taxRate * (1 + ak) * (1 + nds),
+        type: googleChannelById.get(ag.campaign_id) || "—",
+      };
+      if (isZero(patch)) continue;
+      add(resolveZhk(ag.name, canon), "Google Ads", patch);
+    }
   }
   for (const c of yandex ?? []) {
     // Яндекс отдаёт расход в тенге — в $ переводим по среднемесячному курсу НБ РК.

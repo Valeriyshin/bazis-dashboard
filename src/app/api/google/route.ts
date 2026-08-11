@@ -24,9 +24,15 @@ export async function GET(req: NextRequest) {
       db.execute({ sql: dailySql, args: [snapId] }),
       db.execute({ sql: "SELECT * FROM google_campaigns WHERE snapshot_id=? ORDER BY spend DESC", args: [snapId] }),
     ]);
+    // google_adgroups — новая таблица (может отсутствовать на старых базах до первого нового синка).
+    let adgroups: Record<string, unknown>[] = [];
+    try {
+      const rs = await db.execute({ sql: "SELECT * FROM google_adgroups WHERE snapshot_id=? ORDER BY spend DESC", args: [snapId] });
+      adgroups = rowsToObjects(rs);
+    } catch { /* таблицы ещё нет — просто без разбивки по группам объявлений */ }
     const daily = rowsToObjects(dailyRs);
     if (daysParam !== "all") daily.reverse();
-    return NextResponse.json({ snapshot, daily, campaigns: rowsToObjects(campaigns) });
+    return NextResponse.json({ snapshot, daily, campaigns: rowsToObjects(campaigns), adgroups });
   } catch (e) {
     return NextResponse.json({ error: (e as Error).message }, { status: 500 });
   }

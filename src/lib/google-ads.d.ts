@@ -8,6 +8,7 @@ export function runGoogleAdsSync(opts?: {
   until: string;
   days: number;
   campaigns: number;
+  adgroups: number;
   dailyHistorySince: string;
   dailyHistoryDays: number;
 }>;

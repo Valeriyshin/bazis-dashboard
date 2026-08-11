@@ -1055,6 +1055,28 @@ function dynCellStyle(key: DynMetricKey, cur: DynMetrics | null, prev: DynMetric
   return {};
 }
 
+interface DynFlag { icon: string; label: string; sev: "bad" | "warn" | "good" | "neutral"; cplPct: number | null }
+
+// Статус строки по последним двум периодам: резкий рост CPL / выгорание аудитории
+// (частота ≥3 или её резкий скачок) / падение CTR / рост CPL умеренный / стабильно / улучшение.
+// Порядок проверок — по убыванию серьёзности, показываем самый важный сигнал.
+function dynFlag(row: DynRow, platform: DynPlatform): DynFlag | null {
+  const n = row.periods.length;
+  const last = row.periods[n - 1], prev = row.periods[n - 2];
+  if (!last || !prev) return null;
+  const cplPct = prev.leads && last.leads ? ((last.cpl - prev.cpl) / prev.cpl) * 100 : null;
+  const ctrPct = prev.ctr ? ((last.ctr - prev.ctr) / prev.ctr) * 100 : null;
+  const freqJump = platform === "Meta" && (last.frequency >= 3 || (prev.frequency > 0 && (last.frequency - prev.frequency) / prev.frequency >= 0.3));
+
+  if (cplPct !== null && cplPct >= 30) return { icon: "🔴", label: "CPL резко вырос", sev: "bad", cplPct };
+  if (freqJump && cplPct !== null && cplPct > 0) return { icon: "🔴", label: "Выгорание аудитории", sev: "bad", cplPct };
+  if (cplPct !== null && cplPct >= 10) return { icon: "🟠", label: "CPL растёт", sev: "warn", cplPct };
+  if (freqJump) return { icon: "🟠", label: "Частота высокая", sev: "warn", cplPct };
+  if (ctrPct !== null && ctrPct <= -20) return { icon: "🟠", label: "CTR падает", sev: "warn", cplPct };
+  if (cplPct !== null && cplPct <= -10) return { icon: "🚀", label: "CPL улучшился", sev: "good", cplPct };
+  return { icon: "🟢", label: "Стабильно", sev: "neutral", cplPct };
+}
+
 // Одна строка дерева (кампания → адсет → объявление). Раскрытие и дочерние строки —
 // только для Meta: у Google/TikTok в дашборде нет уровня групп объявлений.
 function FatigueRow({ row, platform, depth, level, periods }: {
@@ -1107,8 +1129,14 @@ function FatigueRow({ row, platform, depth, level, periods }: {
             </td>
           );
         }))}
+        <td>
+          {(() => {
+            const f = dynFlag(row, platform);
+            return f ? <span title={f.cplPct != null ? `CPL: ${f.cplPct > 0 ? "+" : ""}${f.cplPct.toFixed(0)}%` : ""}>{f.icon} {f.label}</span> : <span className="muted">—</span>;
+          })()}
+        </td>
       </tr>
-      {err && <tr><td colSpan={1 + row.periods.length * DYN_METRICS.length}><span className="err">Ошибка: {err}</span></td></tr>}
+      {err && <tr><td colSpan={2 + row.periods.length * DYN_METRICS.length}><span className="err">Ошибка: {err}</span></td></tr>}
       {expanded && children && children.map((c) => (
         <FatigueRow key={c.id} row={c} platform={platform} depth={depth + 1} level={nextLevel} periods={periods} />
       ))}
@@ -1164,6 +1192,35 @@ function FatigueTracker() {
 
   const fmtShort = (d: string) => new Date(d).toLocaleDateString("ru-RU", { day: "2-digit", month: "short" });
 
+  // Автовыводы по верхнеуровневым (кампания) строкам — по тем же сигналам, что и
+  // колонка "Статус": резкий рост CPL, выгорание аудитории (частота), падение CTR.
+  const insights = useMemo(() => {
+    if (!rows) return null;
+    const flagged = rows.map((r) => ({ ...r, flag: dynFlag(r.row, r.platform) })).filter((r) => r.flag);
+    const bad = flagged.filter((r) => r.flag!.sev === "bad");
+    const warn = flagged.filter((r) => r.flag!.sev === "warn");
+    const good = flagged.filter((r) => r.flag!.sev === "good");
+    const n = periods.length;
+    let curLeads = 0, curSpend = 0, prevLeads = 0, prevSpend = 0;
+    for (const { row } of rows) {
+      const last = row.periods[n - 1], prev = row.periods[n - 2];
+      if (last) { curLeads += last.leads; curSpend += last.spend; }
+      if (prev) { prevLeads += prev.leads; prevSpend += prev.spend; }
+    }
+    const curCpl = curLeads ? curSpend / curLeads : 0;
+    const prevCpl = prevLeads ? prevSpend / prevLeads : 0;
+    const portfolioPct = prevCpl ? ((curCpl - prevCpl) / prevCpl) * 100 : null;
+    return { bad, warn, good, curLeads, prevLeads, curCpl, prevCpl, portfolioPct };
+  }, [rows, periods.length]);
+
+  const dynRecommend = (label: string) => {
+    if (label === "CPL резко вырос") return "рекомендована замена креативов и/или сужение аудитории";
+    if (label === "Выгорание аудитории") return "частота высокая при растущем CPL — обновите креативы или расширьте охват";
+    if (label === "CPL растёт") return "пока не критично, но стоит проверить в следующем периоде";
+    if (label === "CTR падает") return "возможна усталость от креатива — присмотреться к замене";
+    return "";
+  };
+
   return (
     <>
       <div className="panel">
@@ -1199,6 +1256,7 @@ function FatigueTracker() {
                 <tr>
                   <th rowSpan={2}>Кампания</th>
                   {DYN_METRICS.map((m) => <th key={m.key} colSpan={periods.length} style={{ textAlign: "center", borderBottom: "none" }}>{m.label}</th>)}
+                  <th rowSpan={2}>Статус</th>
                 </tr>
                 <tr>
                   {DYN_METRICS.map((m) => periods.map((p, i) => (
@@ -1220,6 +1278,69 @@ function FatigueTracker() {
             <span style={{ background: "rgba(250,204,21,.18)", fontWeight: 600, padding: "0 4px" }}> Частота жёлтым</span> — ≥3 (сигнал усталости аудитории).
             Яндекс.Директ не включён — его API отдаёт отчёты асинхронно (до нескольких минут на запрос), что слишком медленно для интерактивного сравнения нескольких периодов.
           </div>
+        </div>
+      )}
+
+      {insights && (
+        <div className="panel">
+          <div className="panel-title">📊 Выводы</div>
+          <div style={{ marginBottom: 14 }}>
+            Портфель, лидов P{periods.length - 1}→P{periods.length}: <b>{dynInt(insights.prevLeads)}</b> → <b>{dynInt(insights.curLeads)}</b>.
+            {" "}CPL: <b>{insights.prevCpl ? dynMoney(insights.prevCpl) : "—"}</b> → <b>{insights.curCpl ? dynMoney(insights.curCpl) : "—"}</b>
+            {insights.portfolioPct != null && (
+              <span style={{ color: insights.portfolioPct > 0 ? "var(--bad)" : "var(--good)", fontWeight: 600 }}>
+                {" "}({insights.portfolioPct > 0 ? "+" : ""}{insights.portfolioPct.toFixed(1)}%)
+              </span>
+            )}.
+          </div>
+
+          {insights.bad.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, color: "var(--bad)", marginBottom: 6 }}>🔴 Требует внимания</div>
+              <ul style={{ margin: 0, paddingLeft: 20 }}>
+                {insights.bad.map(({ row, platform, flag }) => (
+                  <li key={platform + row.id} style={{ marginBottom: 4 }}>
+                    {DYN_ICON[platform]} <b>{row.name}</b> — {flag!.label}
+                    {flag!.cplPct != null && <> (CPL {flag!.cplPct > 0 ? "+" : ""}{flag!.cplPct.toFixed(0)}%)</>}
+                    {dynRecommend(flag!.label) && <span className="muted"> — {dynRecommend(flag!.label)}</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {insights.warn.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, color: "#f59e0b", marginBottom: 6 }}>🟠 Стоит последить</div>
+              <ul style={{ margin: 0, paddingLeft: 20 }}>
+                {insights.warn.map(({ row, platform, flag }) => (
+                  <li key={platform + row.id} style={{ marginBottom: 4 }}>
+                    {DYN_ICON[platform]} <b>{row.name}</b> — {flag!.label}
+                    {flag!.cplPct != null && <> (CPL {flag!.cplPct > 0 ? "+" : ""}{flag!.cplPct.toFixed(0)}%)</>}
+                    {dynRecommend(flag!.label) && <span className="muted"> — {dynRecommend(flag!.label)}</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {insights.good.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, color: "var(--good)", marginBottom: 6 }}>🚀 Хорошо работает</div>
+              <ul style={{ margin: 0, paddingLeft: 20 }}>
+                {insights.good.map(({ row, platform, flag }) => (
+                  <li key={platform + row.id} style={{ marginBottom: 4 }}>
+                    {DYN_ICON[platform]} <b>{row.name}</b> — {flag!.label}
+                    {flag!.cplPct != null && <> (CPL {flag!.cplPct.toFixed(0)}%)</>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {insights.bad.length === 0 && insights.warn.length === 0 && (
+            <div className="muted">Явных сигналов выгорания (резкий рост CPL, высокая частота, падение CTR) не обнаружено.</div>
+          )}
         </div>
       )}
     </>

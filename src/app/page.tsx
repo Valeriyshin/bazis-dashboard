@@ -162,6 +162,39 @@ function resolveZhk(name: string, canon: Map<string, string>): string {
   if (!canon.has(key)) canon.set(key, first);
   return pick(canon.get(key)!);
 }
+
+// Служебные сегменты, которые встречаются ТОЛЬКО в названиях групп объявлений
+// Google Ads (не кампаний) — общий охват без привязки к конкретному ЖК.
+const ADGROUP_NON_ZHK = new Set(["General", "Широкая", "Комплект 1", "Комплект 2", "Комплект 3", "Комплект"].map(normz));
+// Гендерно-возрастные коды вида "МЖ18-54", "МЖ25+", "М18+" — буквы, сразу за ними цифры.
+const AUDIENCE_CODE_RE = /^[a-zа-я]{1,3}\d/i;
+
+// Разбор ЖК для Google ad group: в отличие от кампаний, у групп объявлений НЕТ единой
+// конвенции "код | цель | ... " — ЖК может быть и первым сегментом ("Cascade | General"),
+// и вторым ("Бренд | PARKVILLE"), поэтому не режем позиционно, а фильтруем весь набор.
+function resolveZhkFromAdgroup(name: string, canon: Map<string, string>): string {
+  const cands = segs(name).filter((s) => {
+    const n = normz(s);
+    if (!n || NON_ZHK.has(n) || ADGROUP_NON_ZHK.has(n)) return false;
+    if (/^#?\d+$/.test(s.trim())) return false;
+    if (/^(cpa|cpl|cpm|cpv|cpc|cpe)\d*$/.test(n)) return false;
+    if (AUDIENCE_CODE_RE.test(s.trim())) return false;
+    return true;
+  });
+  if (cands.length === 0) return "Бренд / Общие";
+  const pick = (s: string) => ZHK_CANON[normz(s)] ?? s;
+  for (const c of cands) { const k = normz(c); if (canon.has(k)) return pick(canon.get(k)!); }
+  for (const c of cands) {
+    for (const disp of canon.values()) {
+      if (disp.length < 3) continue;
+      const re = new RegExp(`(^|[^\\p{L}\\p{N}])${reEsc(disp)}([^\\p{L}\\p{N}]|$)`, "iu");
+      if (re.test(c)) return pick(disp);
+    }
+  }
+  const first = cands[0], key = normz(first);
+  if (!canon.has(key)) canon.set(key, first);
+  return pick(canon.get(key)!);
+}
 function domType(ts: Record<string, number>): string {
   const e = Object.entries(ts).sort((a, b) => b[1] - a[1])[0];
   return e ? e[0] : "—";
@@ -358,7 +391,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
         type: googleChannelById.get(ag.campaign_id) || "—",
       };
       if (isZero(patch)) continue;
-      add(resolveZhk(ag.name, canon), "Google Ads", patch);
+      add(resolveZhkFromAdgroup(ag.name, canon), "Google Ads", patch);
     }
   }
   for (const c of yandex ?? []) {

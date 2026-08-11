@@ -1018,12 +1018,41 @@ const dynMoney = (n: number) => "$" + n.toLocaleString("ru-RU", { maximumFractio
 const dynInt = (n: number) => Math.round(n).toLocaleString("ru-RU");
 const dynPct = (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%";
 
-function dynDelta(a: number | undefined, b: number | undefined, goodDown: boolean) {
-  if (!a || !b) return <span className="muted">—</span>;
-  const pct = ((b - a) / a) * 100;
-  let sent: "good" | "bad" | "neutral" = "neutral";
-  if (Math.abs(pct) >= 5) sent = (pct > 0) === goodDown ? "bad" : "good";
-  return <span className={"delta " + sent}>{(pct > 0 ? "+" : "") + pct.toLocaleString("ru-RU", { maximumFractionDigits: 0 }) + "%"}</span>;
+// Группы колонок: каждая метрика — своим блоком из N колонок (по числу периодов),
+// а не наоборот. metaOnly — колонки с "—" для Google Ads/TikTok (нет данных).
+const DYN_METRICS = [
+  { key: "leads", label: "Лидов", metaOnly: false },
+  { key: "cpl", label: "CPL $", metaOnly: false },
+  { key: "spend", label: "Spend $", metaOnly: false },
+  { key: "reach", label: "Охват", metaOnly: true },
+  { key: "frequency", label: "Частота", metaOnly: true },
+  { key: "ctr", label: "CTR", metaOnly: false },
+] as const;
+type DynMetricKey = (typeof DYN_METRICS)[number]["key"];
+
+const dynFmt = (key: DynMetricKey, v: number) => {
+  if (key === "leads") return dynInt(v);
+  if (key === "cpl" || key === "spend") return dynMoney(v);
+  if (key === "reach") return dynInt(v);
+  if (key === "frequency") return v.toFixed(2);
+  return dynPct(v);
+};
+
+// Заливка прямо в ячейке (не отдельной Δ-колонкой): CPL красным/зелёным при
+// изменении ≥5% к предыдущему периоду в этой же строке; Частота — оранжевым
+// при ≥3 (порог визуальной усталости аудитории), независимо от истории.
+function dynCellStyle(key: DynMetricKey, cur: DynMetrics | null, prev: DynMetrics | null): React.CSSProperties {
+  if (key === "cpl") {
+    if (!cur?.leads || !prev?.leads) return {};
+    const pct = ((cur.cpl - prev.cpl) / prev.cpl) * 100;
+    if (Math.abs(pct) < 5) return {};
+    return pct > 0 ? { color: "var(--bad)", fontWeight: 600 } : { color: "var(--good)", fontWeight: 600 };
+  }
+  if (key === "frequency") {
+    if (!cur || cur.frequency < 3) return {};
+    return { background: "rgba(250,204,21,.18)", fontWeight: 600 };
+  }
+  return {};
 }
 
 // Одна строка дерева (кампания → адсет → объявление). Раскрытие и дочерние строки —
@@ -1055,9 +1084,6 @@ function FatigueRow({ row, platform, depth, level, periods }: {
     setExpanded(!expanded);
   };
 
-  const last = row.periods[row.periods.length - 1];
-  const prev = row.periods[row.periods.length - 2];
-
   return (
     <>
       <tr>
@@ -1071,16 +1097,18 @@ function FatigueRow({ row, platform, depth, level, periods }: {
           {depth === 0 && <span style={{ marginRight: 6 }}>{DYN_ICON[platform]}</span>}
           {row.name}
         </td>
-        {row.periods.map((p, i) => [
-          <td key={i + "s"}>{p ? dynMoney(p.spend) : "—"}</td>,
-          <td key={i + "r"}>{p && platform === "Meta" ? dynInt(p.reach) : "—"}</td>,
-          <td key={i + "f"}>{p && platform === "Meta" ? p.frequency.toFixed(2) : "—"}</td>,
-          <td key={i + "c"}>{p ? dynPct(p.ctr) : "—"}</td>,
-          <td key={i + "l"}>{p && p.leads ? dynMoney(p.cpl) : "—"}</td>,
-        ])}
-        <td>{dynDelta(prev?.cpl, last?.cpl, false)}</td>
+        {DYN_METRICS.map((m) => row.periods.map((p, i) => {
+          const skip = m.metaOnly && platform !== "Meta";
+          const cellVal = p && !skip ? p[m.key as keyof DynMetrics] : null;
+          const show = cellVal != null && !(m.key === "cpl" && !p?.leads);
+          return (
+            <td key={m.key + i} style={p ? dynCellStyle(m.key, p, row.periods[i - 1] ?? null) : {}}>
+              {show ? dynFmt(m.key, cellVal as number) : "—"}
+            </td>
+          );
+        }))}
       </tr>
-      {err && <tr><td colSpan={2 + row.periods.length * 5}><span className="err">Ошибка: {err}</span></td></tr>}
+      {err && <tr><td colSpan={1 + row.periods.length * DYN_METRICS.length}><span className="err">Ошибка: {err}</span></td></tr>}
       {expanded && children && children.map((c) => (
         <FatigueRow key={c.id} row={c} platform={platform} depth={depth + 1} level={nextLevel} periods={periods} />
       ))}
@@ -1170,14 +1198,12 @@ function FatigueTracker() {
               <thead>
                 <tr>
                   <th rowSpan={2}>Кампания</th>
-                  {periods.map((p, i) => <th key={i} colSpan={5} style={{ textAlign: "center", borderBottom: "none" }}>P{i + 1} · {fmtShort(p.since)}–{fmtShort(p.until)}</th>)}
-                  <th rowSpan={2}>Δ CPL</th>
+                  {DYN_METRICS.map((m) => <th key={m.key} colSpan={periods.length} style={{ textAlign: "center", borderBottom: "none" }}>{m.label}</th>)}
                 </tr>
                 <tr>
-                  {periods.map((_, i) => [
-                    <th key={i + "s"}>Расход</th>, <th key={i + "r"}>Reach</th>, <th key={i + "f"}>Freq.</th>,
-                    <th key={i + "c"}>CTR</th>, <th key={i + "l"}>CPL</th>,
-                  ])}
+                  {DYN_METRICS.map((m) => periods.map((p, i) => (
+                    <th key={m.key + i} title={`${fmtShort(p.since)}–${fmtShort(p.until)}`}>P{i + 1}</th>
+                  )))}
                 </tr>
               </thead>
               <tbody>
@@ -1188,8 +1214,11 @@ function FatigueTracker() {
             </table>
           </div>
           <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
-            Данные тянутся из API площадок в реальном времени за выбранные периоды (без записи в базу). Reach/Frequency доступны только у Meta.
-            Δ CPL — изменение цены лида между последними двумя периодами (красный — рост ≥5%, зелёный — снижение ≥5%). Яндекс.Директ не включён — его API отдаёт отчёты асинхронно (до нескольких минут на запрос), что слишком медленно для интерактивного сравнения нескольких периодов.
+            Данные тянутся из API площадок в реальном времени за выбранные периоды (без записи в базу). Охват/Частота доступны только у Meta.
+            <span style={{ color: "var(--bad)", fontWeight: 600 }}> CPL красным</span> — вырос ≥5% к предыдущему периоду в этой строке,
+            <span style={{ color: "var(--good)", fontWeight: 600 }}> зелёным</span> — снизился ≥5%.
+            <span style={{ background: "rgba(250,204,21,.18)", fontWeight: 600, padding: "0 4px" }}> Частота жёлтым</span> — ≥3 (сигнал усталости аудитории).
+            Яндекс.Директ не включён — его API отдаёт отчёты асинхронно (до нескольких минут на запрос), что слишком медленно для интерактивного сравнения нескольких периодов.
           </div>
         </div>
       )}

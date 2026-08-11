@@ -96,6 +96,13 @@ const ZHK_CANON: Record<string, string> = {
   "nurlydala2": "Nurly Dala II",
 };
 
+// Ручная привязка конкретных Google ad group → ЖК, когда в названии группы объявлений
+// нет ни одного узнаваемого сегмента (только техническое "МЖ18-54 | Широкая" и т.п.),
+// но по факту известно, что это конкретный проект/ЖК.
+const ADGROUP_ZHK_OVERRIDE: Record<string, string> = {
+  "197448007198": "Роща Баума", // 2002HUBATY | YT InStream | HUB ALMATY — видео про благоустройство рощи Баума
+};
+
 // Класс жилья — ручные данные, в рекламных кабинетах их нет. Затравка составлена
 // по прошлым отчётам (там, где класс был реально заполнен); для новых ЖК будет
 // пусто — колонка помечается жёлтым в выгрузке для заполнения руками.
@@ -391,7 +398,7 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
         type: googleChannelById.get(ag.campaign_id) || "—",
       };
       if (isZero(patch)) continue;
-      add(resolveZhkFromAdgroup(ag.name, canon), "Google Ads", patch);
+      add(ADGROUP_ZHK_OVERRIDE[ag.ad_group_id] ?? resolveZhkFromAdgroup(ag.name, canon), "Google Ads", patch);
     }
   }
   for (const c of yandex ?? []) {

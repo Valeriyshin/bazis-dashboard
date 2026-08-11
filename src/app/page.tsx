@@ -26,7 +26,7 @@ interface ApiData {
   summary: { author: string; created_at: string; data: SummaryData | null } | null;
 }
 
-const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "TikTok", "Сводка"] as const;
+const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "TikTok", "Сводка", "Выгорание"] as const;
 type Tab = (typeof TABS)[number];
 const LINE_COLORS = ["#4f8cff", "#34d399", "#f59e0b", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#facc15", "#60a5fa", "#4ade80", "#fb923c"];
 
@@ -75,6 +75,7 @@ export default function Page() {
       {tab === "Google Ads" && <GoogleAds metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} />}
       {tab === "Яндекс" && <YandexAds />}
       {tab === "TikTok" && <TiktokAds />}
+      {tab === "Выгорание" && <FatigueTracker />}
     </div>
   );
 }
@@ -1002,6 +1003,196 @@ function TiktokAds() {
         </div>
         <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>Суммы в долларах (кабинет в USD). &quot;Лидген формы&quot; — конверсии по цели кампании в TikTok Ads.</div>
       </div>
+    </>
+  );
+}
+
+/* ============ Выгорание креативов/аудитории (динамика по периодам) ============ */
+interface DynPeriod { since: string; until: string }
+type DynMetrics = { spend: number; impressions: number; reach: number; frequency: number; clicks: number; ctr: number; leads: number; cpl: number };
+interface DynRow { id: string; name: string; periods: (DynMetrics | null)[] }
+type DynPlatform = "Meta" | "Google Ads" | "TikTok";
+const DYN_ICON: Record<DynPlatform, string> = { Meta: "🔵", "Google Ads": "🔴", TikTok: "⚫" };
+
+const dynMoney = (n: number) => "$" + n.toLocaleString("ru-RU", { maximumFractionDigits: n < 100 ? 2 : 0 });
+const dynInt = (n: number) => Math.round(n).toLocaleString("ru-RU");
+const dynPct = (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%";
+
+function dynDelta(a: number | undefined, b: number | undefined, goodDown: boolean) {
+  if (!a || !b) return <span className="muted">—</span>;
+  const pct = ((b - a) / a) * 100;
+  let sent: "good" | "bad" | "neutral" = "neutral";
+  if (Math.abs(pct) >= 5) sent = (pct > 0) === goodDown ? "bad" : "good";
+  return <span className={"delta " + sent}>{(pct > 0 ? "+" : "") + pct.toLocaleString("ru-RU", { maximumFractionDigits: 0 }) + "%"}</span>;
+}
+
+// Одна строка дерева (кампания → адсет → объявление). Раскрытие и дочерние строки —
+// только для Meta: у Google/TikTok в дашборде нет уровня групп объявлений.
+function FatigueRow({ row, platform, depth, level, periods }: {
+  row: DynRow; platform: DynPlatform; depth: number; level: "campaign" | "adset" | "ad"; periods: DynPeriod[];
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [children, setChildren] = useState<DynRow[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const canExpand = platform === "Meta" && level !== "ad";
+  const nextLevel = level === "campaign" ? "adset" : "ad";
+
+  const toggle = async () => {
+    if (!canExpand) return;
+    if (!expanded && children === null) {
+      setLoading(true); setErr(null);
+      try {
+        const res = await fetch("/api/dynamics/meta", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ level: nextLevel, parentId: row.id, periods }),
+        });
+        const j = await res.json();
+        if (!res.ok) setErr(j.error || "Ошибка"); else setChildren(j.rows);
+      } catch (e) { setErr(String(e)); }
+      setLoading(false);
+    }
+    setExpanded(!expanded);
+  };
+
+  const last = row.periods[row.periods.length - 1];
+  const prev = row.periods[row.periods.length - 2];
+
+  return (
+    <>
+      <tr>
+        <td style={{ paddingLeft: 12 + depth * 20, maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+          title={row.name}>
+          {canExpand && (
+            <span onClick={toggle} style={{ cursor: "pointer", display: "inline-block", width: 16 }}>
+              {loading ? "⏳" : expanded ? "▾" : "▸"}
+            </span>
+          )}
+          {depth === 0 && <span style={{ marginRight: 6 }}>{DYN_ICON[platform]}</span>}
+          {row.name}
+        </td>
+        {row.periods.map((p, i) => [
+          <td key={i + "s"}>{p ? dynMoney(p.spend) : "—"}</td>,
+          <td key={i + "r"}>{p && platform === "Meta" ? dynInt(p.reach) : "—"}</td>,
+          <td key={i + "f"}>{p && platform === "Meta" ? p.frequency.toFixed(2) : "—"}</td>,
+          <td key={i + "c"}>{p ? dynPct(p.ctr) : "—"}</td>,
+          <td key={i + "l"}>{p && p.leads ? dynMoney(p.cpl) : "—"}</td>,
+        ])}
+        <td>{dynDelta(prev?.cpl, last?.cpl, false)}</td>
+      </tr>
+      {err && <tr><td colSpan={2 + row.periods.length * 5}><span className="err">Ошибка: {err}</span></td></tr>}
+      {expanded && children && children.map((c) => (
+        <FatigueRow key={c.id} row={c} platform={platform} depth={depth + 1} level={nextLevel} periods={periods} />
+      ))}
+    </>
+  );
+}
+
+function FatigueTracker() {
+  const today = new Date().toISOString().slice(0, 10);
+  const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  const [periods, setPeriods] = useState<DynPeriod[]>([
+    { since: daysAgo(27), until: daysAgo(21) },
+    { since: daysAgo(20), until: daysAgo(14) },
+    { since: daysAgo(13), until: daysAgo(7) },
+    { since: daysAgo(6), until: today },
+  ]);
+  const [rows, setRows] = useState<{ row: DynRow; platform: DynPlatform }[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [errs, setErrs] = useState<string[]>([]);
+
+  const addPeriod = () => {
+    if (periods.length >= 6) return;
+    const lastUntil = periods[periods.length - 1]?.until || today;
+    setPeriods([...periods, { since: lastUntil, until: today }]);
+  };
+  const removePeriod = (i: number) => { if (periods.length > 2) setPeriods(periods.filter((_, idx) => idx !== i)); };
+  const updatePeriod = (i: number, field: "since" | "until", v: string) =>
+    setPeriods(periods.map((p, idx) => (idx === i ? { ...p, [field]: v } : p)));
+
+  const run = async () => {
+    setLoading(true); setErrs([]); setRows(null);
+    const collected: { row: DynRow; platform: DynPlatform }[] = [];
+    const errors: string[] = [];
+    const calls: [DynPlatform, string][] = [["Meta", "/api/dynamics/meta"], ["Google Ads", "/api/dynamics/google"], ["TikTok", "/api/dynamics/tiktok"]];
+    await Promise.all(calls.map(async ([platform, url]) => {
+      try {
+        const res = await fetch(url, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(platform === "Meta" ? { level: "campaign", periods } : { periods }),
+        });
+        const j = await res.json();
+        if (!res.ok) { errors.push(`${platform}: ${j.error || res.status}`); return; }
+        for (const row of j.rows as DynRow[]) collected.push({ row, platform });
+      } catch (e) { errors.push(`${platform}: ${String(e)}`); }
+    }));
+    collected.sort((a, b) => {
+      const sa = a.row.periods.reduce((s, p) => s + (p?.spend ?? 0), 0);
+      const sb = b.row.periods.reduce((s, p) => s + (p?.spend ?? 0), 0);
+      return sb - sa;
+    });
+    setRows(collected); setErrs(errors); setLoading(false);
+  };
+
+  const fmtShort = (d: string) => new Date(d).toLocaleDateString("ru-RU", { day: "2-digit", month: "short" });
+
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-title">Периоды для сравнения</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {periods.map((p, i) => (
+            <div key={i} className="controls" style={{ alignItems: "end" }}>
+              <div style={{ alignSelf: "center", minWidth: 46, color: "var(--muted)" }}>P{i + 1}</div>
+              <div className="field"><label>с</label><input type="date" value={p.since} onChange={(e) => updatePeriod(i, "since", e.target.value)} /></div>
+              <div className="field"><label>по</label><input type="date" value={p.until} onChange={(e) => updatePeriod(i, "until", e.target.value)} /></div>
+              {periods.length > 2 && <button className="btn" onClick={() => removePeriod(i)}>✕</button>}
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+          {periods.length < 6 && <button className="btn" onClick={addPeriod}>+ Период</button>}
+          <button className="btn" onClick={run} disabled={loading} style={{ marginLeft: "auto" }}>
+            {loading ? "⏳ Загрузка…" : "Показать динамику"}
+          </button>
+        </div>
+        {errs.length > 0 && <div className="err" style={{ marginTop: 10 }}>{errs.join(" · ")}</div>}
+      </div>
+
+      {rows && (
+        <div className="panel">
+          <div className="panel-title">Динамика по кампаниям ({rows.length})</div>
+          <div className="muted" style={{ marginBottom: 10, fontSize: 12 }}>
+            ▸ у Meta-кампаний раскрывает группы объявлений, затем — отдельные объявления. У Google Ads и TikTok — только уровень кампаний.
+          </div>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th rowSpan={2}>Кампания</th>
+                  {periods.map((p, i) => <th key={i} colSpan={5} style={{ textAlign: "center", borderBottom: "none" }}>P{i + 1} · {fmtShort(p.since)}–{fmtShort(p.until)}</th>)}
+                  <th rowSpan={2}>Δ CPL</th>
+                </tr>
+                <tr>
+                  {periods.map((_, i) => [
+                    <th key={i + "s"}>Расход</th>, <th key={i + "r"}>Reach</th>, <th key={i + "f"}>Freq.</th>,
+                    <th key={i + "c"}>CTR</th>, <th key={i + "l"}>CPL</th>,
+                  ])}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(({ row, platform }) => (
+                  <FatigueRow key={platform + row.id} row={row} platform={platform} depth={0} level="campaign" periods={periods} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+            Данные тянутся из API площадок в реальном времени за выбранные периоды (без записи в базу). Reach/Frequency доступны только у Meta.
+            Δ CPL — изменение цены лида между последними двумя периодами (красный — рост ≥5%, зелёный — снижение ≥5%). Яндекс.Директ не включён — его API отдаёт отчёты асинхронно (до нескольких минут на запрос), что слишком медленно для интерактивного сравнения нескольких периодов.
+          </div>
+        </div>
+      )}
     </>
   );
 }

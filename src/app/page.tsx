@@ -94,6 +94,13 @@ const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const ZHK_CANON: Record<string, string> = {
   "jandostar": "Jan Dostar",
   "nurlydala2": "Nurly Dala II",
+  // Разные написания одного и того же ЖК в разных кабинетах/адсетах — сводим в одно.
+  "admplus": "Adamant Plus",
+  "adamantplus": "Adamant Plus",
+  "admlife": "Adamant Life",
+  "adamantlife": "Adamant Life",
+  "eliosпост": "Elios", // "Elios — пост" (адсет с постовым форматом) — тот же ЖК, что и "Elios"
+  "parkvile": "Parkville", // опечатка в названии адсета ("Parkvile" вместо "Parkville")
 };
 
 // Ручная привязка конкретных Google ad group → ЖК, когда в названии группы объявлений
@@ -132,7 +139,7 @@ const NON_ZHK = new Set([
   "Трафик", "Конверсии", "Продажи", "Сообщения", "Установки",
   "YT Shorts", "YT InStream", "YouTube Multiple Formats", "Adv", "Adv+", "Wide", "LAL",
   "Летние Скидки", "Коммерция", "Smart+", "TT", "4 города", "3 города", "2 города",
-  "IG", "IG+FB", "FB", "AstAud", "База Аст", "Бренд",
+  "IG", "IG+FB", "FB", "AstAud", "База Аст", "База", "Бренд",
 ].map(normz));
 
 // Содержательные сегменты названия (кандидаты на ЖК): без кода кампании, города, бренда, цели.
@@ -231,7 +238,7 @@ interface GAdgroup { ad_group_id: string; campaign_id: string; name: string; spe
 
 // Кампании, которые бьём не по ЖК, а по городам (группам объявлений) — это
 // сквозные акции на несколько городов сразу, у них нет единого ЖК-названия.
-const MULTICITY_RE = /коммерц|летние\s*скидк/i;
+const MULTICITY_RE = /коммерц|летние\s*скидк|summer\s*fest/i;
 const CITY_LIST = ["Алматы", "Астана", "Шымкент", "Атырау", "Караганда", "Актобе"];
 // HUB-кампании (Meta и Google) — сборные по нескольким ЖК сразу, ЖК виден только на
 // уровне группы объявлений (Meta: адсет, Google: ad group), а не в названии кампании.
@@ -330,15 +337,16 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
     add(resolveZhk(c.name, canon), "Meta", patch);
   }
   {
-    // Сквозные акции (Коммерция / Летние скидки) без единого ЖК — бьём по городам
-    // из названий групп объявлений (адсетов).
+    // Сквозные акции (Коммерция / Летние скидки / Summer Fest) без единого ЖК — бьём по
+    // городам из названий групп объявлений (адсетов).
     const multiCampaignIds = new Set(metaCampaigns.filter((c) => MULTICITY_RE.test(c.name)).map((c) => c.campaign_id));
     const campaignById = new Map(metaCampaigns.map((c) => [c.campaign_id, c]));
     for (const a of metaAdsets) {
       if (!a.campaign_id || !multiCampaignIds.has(a.campaign_id)) continue;
       const camp = campaignById.get(a.campaign_id);
       if (!camp) continue;
-      const label = /летние\s*скидк/i.test(camp.name) ? "Летние скидки" : "Коммерция";
+      const label = /летние\s*скидк/i.test(camp.name) ? "Летние скидки"
+        : /summer\s*fest/i.test(camp.name) ? "Summer Fest" : "Коммерция";
       const city = CITY_LIST.find((ct) => a.name.includes(ct)) || "Прочее";
       const ac = a as unknown as Record<string, number | string>;
       const spend = +ac.spend;

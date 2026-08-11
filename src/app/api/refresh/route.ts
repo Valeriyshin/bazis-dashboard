@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { runSync } from "@/lib/sync.mjs";
 import { runGoogleAdsSync } from "@/lib/google-ads.mjs";
 import { runYandexSync } from "@/lib/yandex.mjs";
+import { runTiktokSync } from "@/lib/tiktok.mjs";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -28,7 +29,13 @@ export async function POST(req: NextRequest) {
     } catch (e) {
       yandexError = (e as Error).message;
     }
-    return NextResponse.json({ ok: true, meta, google, googleError, yandex, yandexError });
+    let tiktok: unknown = null, tiktokError: string | null = null;
+    try {
+      tiktok = await runTiktokSync({ since, until, days });
+    } catch (e) {
+      tiktokError = (e as Error).message;
+    }
+    return NextResponse.json({ ok: true, meta, google, googleError, yandex, yandexError, tiktok, tiktokError });
   } catch (e) {
     return NextResponse.json({ error: (e as Error).message }, { status: 500 });
   }

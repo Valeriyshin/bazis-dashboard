@@ -69,7 +69,7 @@ export default function Page() {
         ))}
       </div>
 
-      {tab === "Обзор" && <><OverviewCompare daily={data.daily} /><ZhkSummary metaCampaigns={data.campaigns} metaAdsets={data.adsets} /></>}
+      {tab === "Обзор" && <><OverviewCompare daily={data.daily} /><ZhkSummary metaCampaigns={data.campaigns} metaAdsets={data.adsets} metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} /></>}
       {tab === "Meta" && <><Dynamics daily={data.daily} /><Breakdown campaigns={data.campaigns} adsets={data.adsets} ads={data.ads} snapshot={data.snapshot} /></>}
       {tab === "Сводка" && <Summary summary={data.summary} />}
       {tab === "Google Ads" && <GoogleAds metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} />}
@@ -192,7 +192,7 @@ interface TCampaign { campaign_id: string; name: string; spend: number; impressi
 const MULTICITY_RE = /коммерц|летние\s*скидк/i;
 const CITY_LIST = ["Алматы", "Астана", "Шымкент", "Атырау", "Караганда", "Актобе"];
 
-function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; metaAdsets: Entity[] }) {
+function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: Entity[]; metaAdsets: Entity[]; metaPeriod: { start: string; end: string } }) {
   const [google, setGoogle] = useState<GCampaign[] | null>(null);
   const [yandex, setYandex] = useState<YCampaign[] | null>(null);
   const [tiktok, setTiktok] = useState<TCampaign[] | null>(null);
@@ -204,16 +204,29 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
   const [exporting, setExporting] = useState(false);
   const [fxMonths, setFxMonths] = useState<{ month: string; rate: number; days: number }[]>([]);
   const [cols, setCols] = useState<string[]>(ZHK_DEFAULT);
+  // Период снапшота каждой площадки — чтобы предупредить, если какая-то из них
+  // отстала (например, TikTok не попал в ручной ↻ Обновить за произвольный период
+  // и остался на своём обычном скользящем окне — иначе её цифры молча подмешаются
+  // в отчёт за совсем другой диапазон дат).
+  const [periods, setPeriods] = useState<Record<string, { start: string; end: string } | null>>({});
   useEffect(() => {
-    fetch("/api/google").then((r) => r.json()).then((d) => setGoogle(d.error ? [] : d.campaigns)).catch(() => setGoogle([]));
+    fetch("/api/google").then((r) => r.json()).then((d) => {
+      setGoogle(d.error ? [] : d.campaigns);
+      setPeriods((p) => ({ ...p, "Google Ads": d.snapshot ? { start: d.snapshot.period_start, end: d.snapshot.period_end } : null }));
+    }).catch(() => setGoogle([]));
     fetch("/api/yandex").then((r) => r.json()).then((d) => {
-      if (d.error) { setYandex([]); return; }
+      if (d.error) { setYandex([]); setPeriods((p) => ({ ...p, "Yandex Direct": null })); return; }
       setYandex(d.campaigns);
       if (d.rate) setRate(d.rate);
       if (d.fxMonths) setFxMonths(d.fxMonths);
+      setPeriods((p) => ({ ...p, "Yandex Direct": { start: d.snapshot.period_start, end: d.snapshot.period_end } }));
     }).catch(() => setYandex([]));
-    fetch("/api/tiktok").then((r) => r.json()).then((d) => setTiktok(d.error ? [] : d.campaigns)).catch(() => setTiktok([]));
+    fetch("/api/tiktok").then((r) => r.json()).then((d) => {
+      setTiktok(d.error ? [] : d.campaigns);
+      setPeriods((p) => ({ ...p, TikTok: d.snapshot ? { start: d.snapshot.period_start, end: d.snapshot.period_end } : null }));
+    }).catch(() => setTiktok([]));
   }, []);
+  const periodMismatches = Object.entries(periods).filter(([, p]) => p && (p.start !== metaPeriod.start || p.end !== metaPeriod.end));
   const [sortKey, setSortKey] = useState<string>("spend");
   const [asc, setAsc] = useState(false);
   const active = ZHK_COLS.filter((c) => cols.includes(c.key));
@@ -483,6 +496,15 @@ function ZhkSummary({ metaCampaigns, metaAdsets }: { metaCampaigns: Entity[]; me
   return (
     <div className="panel">
       <div className="panel-title">Сводные данные по всем ЖК за период {google === null && <span className="muted">(загрузка Google…)</span>}</div>
+      {periodMismatches.length > 0 && (
+        <div className="err" style={{ marginBottom: 14, padding: 10, border: "1px solid var(--bad)", borderRadius: 8 }}>
+          ⚠ Период Meta: {metaPeriod.start} — {metaPeriod.end}. У этих площадок другой период в базе — их цифры относятся к другому диапазону дат, суммы ниже будут некорректны:
+          <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+            {periodMismatches.map(([sys, p]) => <li key={sys}>{sys}: {p!.start} — {p!.end}</li>)}
+          </ul>
+          Нажмите <b>↻ Обновить</b> с нужным периодом наверху страницы, чтобы пересинхронизировать все площадки разом.
+        </div>
+      )}
       <div style={{ marginBottom: 14 }}>
         <div className="panel-title" style={{ fontSize: 13 }}>Столбцы</div>
         <div className="chips">
@@ -1364,9 +1386,14 @@ function RefreshBar({ snapshot }: { snapshot: ApiData["snapshot"] }) {
       });
       const j = await res.json();
       if (!res.ok) { setMsg("Ошибка: " + (j.error || res.status)); setLoading(false); return; }
-      // Google синхронизируется best-effort — если упал, показываем, а не молчим.
-      if (j.googleError) {
-        setMsg("Meta обновлена, но Google Ads не удалось: " + String(j.googleError).slice(0, 160));
+      // Остальные площадки синхронизируются best-effort — если какая-то упала, показываем,
+      // а не молчим (иначе в сводке останутся данные за старый период с этой площадки).
+      const failed: string[] = [];
+      if (j.googleError) failed.push("Google Ads: " + String(j.googleError).slice(0, 120));
+      if (j.yandexError) failed.push("Яндекс: " + String(j.yandexError).slice(0, 120));
+      if (j.tiktokError) failed.push("TikTok: " + String(j.tiktokError).slice(0, 120));
+      if (failed.length) {
+        setMsg("Meta обновлена, но не удалось: " + failed.join(" · "));
         setLoading(false);
         return;
       }

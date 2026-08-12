@@ -1507,6 +1507,13 @@ function normPhones(raw: string | number | null): string[] {
     .map((d) => d.slice(-10));
 }
 
+// "05.06.2026" → "20260605" для корректного сравнения дат (лексикографически dd.mm.yyyy
+// сортируется по дню, а не по году). Нераспознанное — в конец.
+function sortableDate(s: string): string {
+  const m = String(s).match(/(\d{2})[.\-/](\d{2})[.\-/](\d{4})/);
+  return m ? m[3] + m[2] + m[1] : "99999999";
+}
+
 // Строка (0-индексная), в которой хотя бы одна ячейка содержит keyword — ищем заголовок.
 function findHeaderRow(rows: SheetRow[], keyword: string): number {
   const k = keyword.toLowerCase();
@@ -1529,10 +1536,17 @@ function buildHeaders(rows: SheetRow[], headerRow: number): string[] {
   }
   return out;
 }
+// Точное совпадение имеет приоритет над подстрокой: иначе ключ "номер телефона"
+// цепляется за "Дополнительный номер телефона" вместо колонки "Телефон".
 function findCol(headers: string[], ...keywords: string[]): number {
+  const norm = headers.map((h) => h.toLowerCase().trim());
+  for (const kw of keywords) {
+    const i = norm.indexOf(kw.toLowerCase());
+    if (i >= 0) return i;
+  }
   for (const kw of keywords) {
     const k = kw.toLowerCase();
-    const i = headers.findIndex((h) => h.toLowerCase().includes(k));
+    const i = norm.findIndex((h) => h.includes(k));
     if (i >= 0) return i;
   }
   return -1;
@@ -1544,6 +1558,17 @@ async function readSheet(file: File): Promise<SheetRow[]> {
     ? XLSX.read(await file.text(), { type: "string" })
     : XLSX.read(await file.arrayBuffer(), { type: "array" });
   const ws = wb.Sheets[wb.SheetNames[0]];
+  // Выгрузки этой CRM пишут в <dimension> заведомо неверный диапазон (например
+  // "A1:AB15" при 4624 фактических строках), а SheetJS обрезает лист по нему —
+  // из 4614 договоров читалось 5. Пересчитываем ref по реальным адресам ячеек.
+  let maxR = 0, maxC = 0;
+  for (const addr of Object.keys(ws)) {
+    if (addr.startsWith("!")) continue;
+    const { r, c } = XLSX.utils.decode_cell(addr);
+    if (r > maxR) maxR = r;
+    if (c > maxC) maxC = c;
+  }
+  if (maxR > 0) ws["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: maxR, c: maxC } });
   return XLSX.utils.sheet_to_json<SheetRow>(ws, { header: 1, defval: "" }) as unknown as SheetRow[];
 }
 
@@ -1636,8 +1661,13 @@ function SalesReconcile() {
         if (ah < 0) throw new Error("В выгрузке из Центра лидов не найдена колонка с телефоном (phone_number / Телефон)");
         const aHeaders = buildHeaders(adLeadRows, ah);
         const aCol = {
-          phone: findCol(aHeaders, "phone_number", "phone", "телефон"),
-          campaign: findCol(aHeaders, "campaign_name", "название кампании", "кампания"),
+          // Выгрузка Центра лидов бывает двух видов: "родная" из Ads Manager
+          // (phone_number + campaign_name) и из лид-менеджера (Телефон + Форма +
+          // Источник + доп. номера) — поддерживаем оба набора колонок.
+          phone: findCol(aHeaders, "phone_number", "номер телефона", "телефон", "phone"),
+          phone2: findCol(aHeaders, "дополнительный номер"),
+          wa: findCol(aHeaders, "whatsapp"),
+          campaign: findCol(aHeaders, "campaign_name", "название кампании", "кампания", "форма", "form_name"),
           adset: findCol(aHeaders, "adset_name", "название группы", "группа объявлений"),
           ad: findCol(aHeaders, "ad_name", "название объявления"),
           date: findCol(aHeaders, "created_time", "дата создания", "дата"),
@@ -1646,7 +1676,12 @@ function SalesReconcile() {
         for (let i = ah + 1; i < adLeadRows.length; i++) {
           const r = adLeadRows[i];
           if (!r || !r.some((c) => c !== "" && c != null)) continue;
-          for (const phone of normPhones(r[aCol.phone])) {
+          const phones = new Set([
+            ...normPhones(r[aCol.phone]),
+            ...(aCol.phone2 >= 0 ? normPhones(r[aCol.phone2]) : []),
+            ...(aCol.wa >= 0 ? normPhones(r[aCol.wa]) : []),
+          ]);
+          for (const phone of phones) {
             parsedAdLeads.push({
               phone,
               campaign: String(r[aCol.campaign] ?? "").trim() || "—",
@@ -1669,11 +1704,13 @@ function SalesReconcile() {
     setLoading(false);
   };
 
-  // phone → лид (если один телефон встречался у нескольких лидов, берём последний по дате).
+  // phone → лид ПЕРВОГО касания: именно первый контакт привёл клиента, а последующие
+  // обращения того же телефона — уже работа с существующим лидом.
+  // Дату сравниваем как yyyymmdd: "05.06.2026" >= "12.01.2026" строкой даёт неверный порядок.
   const leadByPhone = new Map<string, LeadRow>();
   for (const l of leads ?? []) {
     const prev = leadByPhone.get(l.phone);
-    if (!prev || l.date >= prev.date) leadByPhone.set(l.phone, l);
+    if (!prev || sortableDate(l.date) < sortableDate(prev.date)) leadByPhone.set(l.phone, l);
   }
 
   const matched: { contract: ContractRow; lead: LeadRow | null }[] = (contracts ?? []).map((c) => {
@@ -1681,18 +1718,23 @@ function SalesReconcile() {
     return { contract: c, lead: lead ?? null };
   });
 
-  const recon: Record<string, ReconRow> = {};
+  // Уникальных лидов на канал считаем по телефонам, а не по строкам: в выгрузке
+  // один и тот же клиент встречается многократно (каждое касание — отдельная строка).
   const leadsPerChannel: Record<string, number> = {};
-  for (const l of leads ?? []) leadsPerChannel[l.channel] = (leadsPerChannel[l.channel] ?? 0) + 1;
+  for (const l of leadByPhone.values()) leadsPerChannel[l.channel] = (leadsPerChannel[l.channel] ?? 0) + 1;
+
+  const recon: Record<string, ReconRow & { buyers: Set<string> }> = {};
   for (const { contract, lead } of matched) {
-    const key = lead?.channel || "Не найден лид (сайт/офлайн/вне отчёта)";
-    const row = (recon[key] ??= { channel: key, leadsTotal: leadsPerChannel[key] ?? 0, deals: 0, sum: 0 });
+    if (!contract.phones.length) continue; // без телефона канал определить нельзя
+    const key = lead?.channel || "Не найден лид (сайт/офлайн/вне периода)";
+    const row = (recon[key] ??= { channel: key, leadsTotal: leadsPerChannel[key] ?? 0, deals: 0, sum: 0, buyers: new Set() });
     row.deals += 1;
+    row.buyers.add(contract.phones[0]);
     if (!/растор/i.test(contract.status)) row.sum += contract.sum;
   }
   // Каналы, у которых были лиды, но ни одной сделки — тоже показываем (конверсия 0%).
   for (const [channel, cnt] of Object.entries(leadsPerChannel)) {
-    if (!recon[channel]) recon[channel] = { channel, leadsTotal: cnt, deals: 0, sum: 0 };
+    if (!recon[channel]) recon[channel] = { channel, leadsTotal: cnt, deals: 0, sum: 0, buyers: new Set() };
   }
 
   // То же самое, но по данным Центра лидов (телефон + реальное название кампании из
@@ -1700,8 +1742,7 @@ function SalesReconcile() {
   // отдельной выгрузки и покрывает только лиды, пришедшие через встроенные формы.
   const adLeadByPhone = new Map<string, AdLeadRow>();
   for (const l of adLeads ?? []) {
-    const prev = adLeadByPhone.get(l.phone);
-    if (!prev || l.date >= prev.date) adLeadByPhone.set(l.phone, l);
+    if (!adLeadByPhone.has(l.phone)) adLeadByPhone.set(l.phone, l);
   }
   const adMatched: { contract: ContractRow; adLead: AdLeadRow | null }[] = (contracts ?? []).map((c) => {
     const adLead = c.phones.map((p) => adLeadByPhone.get(p)).find((l) => l) ?? null;
@@ -1709,7 +1750,7 @@ function SalesReconcile() {
   });
   const adRecon: Record<string, AdReconRow> = {};
   const leadsPerCampaign: Record<string, number> = {};
-  for (const l of adLeads ?? []) leadsPerCampaign[l.campaign] = (leadsPerCampaign[l.campaign] ?? 0) + 1;
+  for (const l of adLeadByPhone.values()) leadsPerCampaign[l.campaign] = (leadsPerCampaign[l.campaign] ?? 0) + 1;
   for (const { contract, adLead } of adMatched) {
     if (!adLead) continue; // без совпадения с рекламным лидом — не относим ни к одной кампании
     const key = adLead.campaign;
@@ -1728,6 +1769,9 @@ function SalesReconcile() {
   const totalDeals = matched.length;
   const totalSum = matched.reduce((s, { contract }) => s + (/растор/i.test(contract.status) ? 0 : contract.sum), 0);
   const totalMatched = matched.filter((m) => m.lead).length;
+  // Договоры без телефона сопоставить невозможно в принципе — считаем базу честно от тех, где телефон есть.
+  const withPhone = matched.filter((m) => m.contract.phones.length).length;
+  const noPhone = totalDeals - withPhone;
 
   const rowsToShow = unmatchedOnly ? matched.filter((m) => !m.lead) : matched;
 
@@ -1766,9 +1810,9 @@ function SalesReconcile() {
         <>
           <div className="panel">
             <div className="kpi-grid">
-              <div className="kpi"><div className="label">Лидов в отчёте</div><div className="value">{leads.length}</div></div>
-              <div className="kpi"><div className="label">Договоров</div><div className="value">{totalDeals}</div></div>
-              <div className="kpi"><div className="label">Сопоставлено с лидом</div><div className="value">{totalMatched} ({totalDeals ? Math.round((totalMatched / totalDeals) * 100) : 0}%)</div></div>
+              <div className="kpi"><div className="label">Лидов (уник. телефонов)</div><div className="value">{leadByPhone.size}</div><div className="delta neutral">строк в выгрузке: {leads.length.toLocaleString("ru-RU")}</div></div>
+              <div className="kpi"><div className="label">Договоров</div><div className="value">{totalDeals}</div><div className="delta neutral">из них без телефона: {noPhone}</div></div>
+              <div className="kpi"><div className="label">Сопоставлено с лидом</div><div className="value">{totalMatched} ({withPhone ? Math.round((totalMatched / withPhone) * 100) : 0}%)</div><div className="delta neutral">от {withPhone} договоров с телефоном</div></div>
               <div className="kpi"><div className="label">Сумма договоров (без расторгнутых)</div><div className="value">{money(totalSum)}</div></div>
             </div>
           </div>
@@ -1777,19 +1821,24 @@ function SalesReconcile() {
             <div className="panel-title">По каналам</div>
             <div className="table-scroll">
               <table>
-                <thead><tr><th>Канал лида</th><th>Лидов</th><th>Сделок</th><th>Конверсия в сделку</th><th>Сумма договоров</th></tr></thead>
+                <thead><tr><th>Канал лида</th><th>Лидов (уник.)</th><th>Покупателей</th><th>Договоров</th><th>Конверсия лид→покупатель</th><th>Сумма договоров</th></tr></thead>
                 <tbody>
                   {reconRows.map((r) => (
                     <tr key={r.channel}>
                       <td>{r.channel}</td>
                       <td>{r.leadsTotal || "—"}</td>
+                      <td>{r.buyers.size}</td>
                       <td>{r.deals}</td>
-                      <td>{r.leadsTotal ? ((r.deals / r.leadsTotal) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
+                      <td>{r.leadsTotal ? ((r.buyers.size / r.leadsTotal) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" : "—"}</td>
                       <td>{money(r.sum)}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+            </div>
+            <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+              «Покупателей» и «Договоров» отличаются: один клиент может купить несколько квартир (в ваших данных есть
+              инвестор с 20 договорами по одному номеру) — поэтому конверсия считается по уникальным покупателям, а не по договорам.
             </div>
           </div>
 

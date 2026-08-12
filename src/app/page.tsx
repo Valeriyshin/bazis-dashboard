@@ -26,7 +26,7 @@ interface ApiData {
   summary: { author: string; created_at: string; data: SummaryData | null } | null;
 }
 
-const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "TikTok", "Сводка", "Выгорание"] as const;
+const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "TikTok", "Сводка", "Выгорание", "Сверка продаж"] as const;
 type Tab = (typeof TABS)[number];
 const LINE_COLORS = ["#4f8cff", "#34d399", "#f59e0b", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#facc15", "#60a5fa", "#4ade80", "#fb923c"];
 
@@ -76,6 +76,7 @@ export default function Page() {
       {tab === "Яндекс" && <YandexAds />}
       {tab === "TikTok" && <TiktokAds />}
       {tab === "Выгорание" && <FatigueTracker />}
+      {tab === "Сверка продаж" && <SalesReconcile />}
     </div>
   );
 }
@@ -1487,6 +1488,272 @@ function FatigueTracker() {
             <div className="muted">Явных сигналов выгорания (резкий рост CPL, высокая частота, падение CTR) не обнаружено.</div>
           )}
         </div>
+      )}
+    </>
+  );
+}
+
+/* ============ Сверка продаж: лиды (канал) × договоры (телефон) ============ */
+type SheetRow = (string | number | null)[];
+
+// Телефон → последние 10 цифр (без кода страны/форматирования) — общий ключ сопоставления.
+// Ячейка может содержать несколько телефонов через запятую/точку с запятой/слэш.
+function normPhones(raw: string | number | null): string[] {
+  if (raw == null || raw === "") return [];
+  return String(raw)
+    .split(/[,;/]/)
+    .map((s) => s.replace(/\D/g, ""))
+    .filter((d) => d.length >= 9)
+    .map((d) => d.slice(-10));
+}
+
+// Строка (0-индексная), в которой хотя бы одна ячейка содержит keyword — ищем заголовок.
+function findHeaderRow(rows: SheetRow[], keyword: string): number {
+  const k = keyword.toLowerCase();
+  for (let i = 0; i < Math.min(rows.length, 15); i++) {
+    if ((rows[i] ?? []).some((c) => String(c ?? "").toLowerCase().includes(k))) return i;
+  }
+  return -1;
+}
+// Собираем подписи колонок из строки заголовка, докладывая объединённые ячейки строкой выше
+// (в "Реестр договоров" заголовок двухуровневый: "Оплата" сверху, "Условие оплаты" под ним).
+function buildHeaders(rows: SheetRow[], headerRow: number): string[] {
+  const cur = rows[headerRow] ?? [];
+  const above = rows[headerRow - 1] ?? [];
+  const n = Math.max(cur.length, above.length);
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const c = String(cur[i] ?? "").trim();
+    const a = String(above[i] ?? "").trim();
+    out.push(c || a);
+  }
+  return out;
+}
+function findCol(headers: string[], ...keywords: string[]): number {
+  for (const kw of keywords) {
+    const k = kw.toLowerCase();
+    const i = headers.findIndex((h) => h.toLowerCase().includes(k));
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+async function readSheet(file: File): Promise<SheetRow[]> {
+  // ExcelJS падает на этих выгрузках (нет части docProps/core.xml) — читаем через xlsx (SheetJS).
+  const XLSX = await import("xlsx");
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array" });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return XLSX.utils.sheet_to_json<SheetRow>(ws, { header: 1, defval: "" }) as unknown as SheetRow[];
+}
+
+interface LeadRow { phone: string; channel: string; source: string; object: string; date: string }
+interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string }
+interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: number }
+
+function SalesReconcile() {
+  const [leadsFile, setLeadsFile] = useState<File | null>(null);
+  const [contractsFile, setContractsFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [leads, setLeads] = useState<LeadRow[] | null>(null);
+  const [contracts, setContracts] = useState<ContractRow[] | null>(null);
+  const [unmatchedOnly, setUnmatchedOnly] = useState(false);
+
+  const run = async () => {
+    if (!leadsFile || !contractsFile) { setErr("Загрузите оба файла — «Отчёт по Лидам» и «Реестр договоров»"); return; }
+    setLoading(true); setErr(null);
+    try {
+      const [leadRows, contractRows] = await Promise.all([readSheet(leadsFile), readSheet(contractsFile)]);
+
+      const lh = findHeaderRow(leadRows, "телефон");
+      if (lh < 0) throw new Error("В «Отчёте по Лидам» не найдена колонка «Телефон» — проверьте файл");
+      const lHeaders = buildHeaders(leadRows, lh);
+      const lCol = {
+        phone: findCol(lHeaders, "телефон"),
+        channel: findCol(lHeaders, "канал"),
+        source: findCol(lHeaders, "источник"),
+        object: findCol(lHeaders, "объект"),
+        date: findCol(lHeaders, "дата начала", "дата"),
+      };
+      const parsedLeads: LeadRow[] = [];
+      for (let i = lh + 1; i < leadRows.length; i++) {
+        const r = leadRows[i];
+        if (!r || !r.some((c) => c !== "" && c != null)) continue;
+        const phones = normPhones(r[lCol.phone]);
+        if (!phones.length) continue;
+        for (const phone of phones) {
+          parsedLeads.push({
+            phone,
+            channel: String(r[lCol.channel] ?? "").trim() || "—",
+            source: String(r[lCol.source] ?? "").trim(),
+            object: String(r[lCol.object] ?? "").trim(),
+            date: String(r[lCol.date] ?? "").trim(),
+          });
+        }
+      }
+
+      const ch = findHeaderRow(contractRows, "телефон");
+      if (ch < 0) throw new Error("В «Реестре договоров» не найдена колонка «Телефоны» — проверьте файл");
+      const cHeaders = buildHeaders(contractRows, ch);
+      const cCol = {
+        phones: findCol(cHeaders, "телефон"),
+        sum: findCol(cHeaders, "сумма договора", "сумма"),
+        zhk: findCol(cHeaders, "жк"),
+        status: findCol(cHeaders, "состояние"),
+        date: findCol(cHeaders, "дата"),
+        client: findCol(cHeaders, "наименование", "клиент"),
+        city: findCol(cHeaders, "город"),
+      };
+      const parsedContracts: ContractRow[] = [];
+      for (let i = ch + 1; i < contractRows.length; i++) {
+        const r = contractRows[i];
+        if (!r || !r.some((c) => c !== "" && c != null)) continue;
+        const sumRaw = r[cCol.sum];
+        parsedContracts.push({
+          phones: normPhones(r[cCol.phones]),
+          sum: Number(sumRaw) || 0,
+          zhk: String(r[cCol.zhk] ?? "").trim(),
+          status: String(r[cCol.status] ?? "").trim(),
+          date: String(r[cCol.date] ?? "").trim(),
+          client: String(r[cCol.client] ?? "").trim(),
+          city: String(r[cCol.city] ?? "").trim(),
+        });
+      }
+
+      if (!parsedLeads.length) throw new Error("Не удалось прочитать ни одной строки лидов — проверьте файл");
+      if (!parsedContracts.length) throw new Error("Не удалось прочитать ни одной строки договоров — проверьте файл");
+      setLeads(parsedLeads);
+      setContracts(parsedContracts);
+    } catch (e) {
+      setErr((e as Error).message);
+      setLeads(null); setContracts(null);
+    }
+    setLoading(false);
+  };
+
+  // phone → лид (если один телефон встречался у нескольких лидов, берём последний по дате).
+  const leadByPhone = new Map<string, LeadRow>();
+  for (const l of leads ?? []) {
+    const prev = leadByPhone.get(l.phone);
+    if (!prev || l.date >= prev.date) leadByPhone.set(l.phone, l);
+  }
+
+  const matched: { contract: ContractRow; lead: LeadRow | null }[] = (contracts ?? []).map((c) => {
+    const lead = c.phones.map((p) => leadByPhone.get(p)).find((l) => l) ?? null;
+    return { contract: c, lead: lead ?? null };
+  });
+
+  const recon: Record<string, ReconRow> = {};
+  const leadsPerChannel: Record<string, number> = {};
+  for (const l of leads ?? []) leadsPerChannel[l.channel] = (leadsPerChannel[l.channel] ?? 0) + 1;
+  for (const { contract, lead } of matched) {
+    const key = lead?.channel || "Не найден лид (сайт/офлайн/вне отчёта)";
+    const row = (recon[key] ??= { channel: key, leadsTotal: leadsPerChannel[key] ?? 0, deals: 0, sum: 0 });
+    row.deals += 1;
+    if (!/растор/i.test(contract.status)) row.sum += contract.sum;
+  }
+  // Каналы, у которых были лиды, но ни одной сделки — тоже показываем (конверсия 0%).
+  for (const [channel, cnt] of Object.entries(leadsPerChannel)) {
+    if (!recon[channel]) recon[channel] = { channel, leadsTotal: cnt, deals: 0, sum: 0 };
+  }
+  const reconRows = Object.values(recon).sort((a, b) => b.sum - a.sum);
+
+  const money = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
+  const totalDeals = matched.length;
+  const totalSum = matched.reduce((s, { contract }) => s + (/растор/i.test(contract.status) ? 0 : contract.sum), 0);
+  const totalMatched = matched.filter((m) => m.lead).length;
+
+  const rowsToShow = unmatchedOnly ? matched.filter((m) => !m.lead) : matched;
+
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-title">Сверка: источник лида × реальные продажи</div>
+        <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+          Загрузите «Отчёт по Лидам» (телефон + канал) и «Реестр договоров» (телефон + сумма) за один и тот же период —
+          сопоставление идёт по номеру телефона, без обращения к API рекламных площадок.
+        </div>
+        <div className="controls">
+          <div className="field">
+            <label>Отчёт по Лидам (.xlsx)</label>
+            <input type="file" accept=".xlsx,.xls" onChange={(e) => setLeadsFile(e.target.files?.[0] ?? null)} />
+          </div>
+          <div className="field">
+            <label>Реестр договоров (.xlsx)</label>
+            <input type="file" accept=".xlsx,.xls" onChange={(e) => setContractsFile(e.target.files?.[0] ?? null)} />
+          </div>
+          <button className="btn" onClick={run} disabled={loading} style={{ alignSelf: "end" }}>
+            {loading ? "⏳ Обрабатываю…" : "Сверить"}
+          </button>
+        </div>
+        {err && <div className="err" style={{ marginTop: 10 }}>{err}</div>}
+      </div>
+
+      {leads && contracts && (
+        <>
+          <div className="panel">
+            <div className="kpi-grid">
+              <div className="kpi"><div className="label">Лидов в отчёте</div><div className="value">{leads.length}</div></div>
+              <div className="kpi"><div className="label">Договоров</div><div className="value">{totalDeals}</div></div>
+              <div className="kpi"><div className="label">Сопоставлено с лидом</div><div className="value">{totalMatched} ({totalDeals ? Math.round((totalMatched / totalDeals) * 100) : 0}%)</div></div>
+              <div className="kpi"><div className="label">Сумма договоров (без расторгнутых)</div><div className="value">{money(totalSum)}</div></div>
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-title">По каналам</div>
+            <div className="table-scroll">
+              <table>
+                <thead><tr><th>Канал лида</th><th>Лидов</th><th>Сделок</th><th>Конверсия в сделку</th><th>Сумма договоров</th></tr></thead>
+                <tbody>
+                  {reconRows.map((r) => (
+                    <tr key={r.channel}>
+                      <td>{r.channel}</td>
+                      <td>{r.leadsTotal || "—"}</td>
+                      <td>{r.deals}</td>
+                      <td>{r.leadsTotal ? ((r.deals / r.leadsTotal) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
+                      <td>{money(r.sum)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-title" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>Договоры ({rowsToShow.length})</span>
+              <label style={{ fontSize: 12, fontWeight: 400, display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+                <input type="checkbox" checked={unmatchedOnly} onChange={(e) => setUnmatchedOnly(e.target.checked)} />
+                только без совпадения
+              </label>
+            </div>
+            <div className="table-scroll">
+              <table>
+                <thead><tr><th>Клиент</th><th>ЖК</th><th>Город</th><th>Дата</th><th>Статус</th><th>Сумма</th><th>Канал лида</th><th>Дата лида</th></tr></thead>
+                <tbody>
+                  {rowsToShow.slice(0, 500).map(({ contract, lead }, i) => (
+                    <tr key={i}>
+                      <td style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={contract.client}>{contract.client}</td>
+                      <td>{contract.zhk}</td>
+                      <td>{contract.city}</td>
+                      <td>{contract.date}</td>
+                      <td>{contract.status}</td>
+                      <td>{money(contract.sum)}</td>
+                      <td>{lead ? lead.channel : <span className="muted">не найден</span>}</td>
+                      <td>{lead?.date ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {rowsToShow.length > 500 && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>Показаны первые 500 из {rowsToShow.length}.</div>}
+            <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+              «Не найден» — договор, чей телефон не встретился в «Отчёте по Лидам» за тот же период: возможно, обращение было
+              раньше периода выгрузки, лид пришёл напрямую/по рекомендации, либо номер записан в разных форматах в двух системах.
+            </div>
+          </div>
+        </>
       )}
     </>
   );

@@ -1540,8 +1540,9 @@ function findCol(headers: string[], ...keywords: string[]): number {
 async function readSheet(file: File): Promise<SheetRow[]> {
   // ExcelJS падает на этих выгрузках (нет части docProps/core.xml) — читаем через xlsx (SheetJS).
   const XLSX = await import("xlsx");
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { type: "array" });
+  const wb = file.name.toLowerCase().endsWith(".csv")
+    ? XLSX.read(await file.text(), { type: "string" })
+    : XLSX.read(await file.arrayBuffer(), { type: "array" });
   const ws = wb.Sheets[wb.SheetNames[0]];
   return XLSX.utils.sheet_to_json<SheetRow>(ws, { header: 1, defval: "" }) as unknown as SheetRow[];
 }
@@ -1549,21 +1550,27 @@ async function readSheet(file: File): Promise<SheetRow[]> {
 interface LeadRow { phone: string; channel: string; source: string; object: string; date: string }
 interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string }
 interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: number }
+interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string }
+interface AdReconRow { campaign: string; leadsTotal: number; deals: number; sum: number }
 
 function SalesReconcile() {
   const [leadsFile, setLeadsFile] = useState<File | null>(null);
   const [contractsFile, setContractsFile] = useState<File | null>(null);
+  const [adLeadsFile, setAdLeadsFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [leads, setLeads] = useState<LeadRow[] | null>(null);
   const [contracts, setContracts] = useState<ContractRow[] | null>(null);
+  const [adLeads, setAdLeads] = useState<AdLeadRow[] | null>(null);
   const [unmatchedOnly, setUnmatchedOnly] = useState(false);
 
   const run = async () => {
-    if (!leadsFile || !contractsFile) { setErr("Загрузите оба файла — «Отчёт по Лидам» и «Реестр договоров»"); return; }
+    if (!leadsFile || !contractsFile) { setErr("Загрузите хотя бы «Отчёт по Лидам» и «Реестр договоров»"); return; }
     setLoading(true); setErr(null);
     try {
-      const [leadRows, contractRows] = await Promise.all([readSheet(leadsFile), readSheet(contractsFile)]);
+      const [leadRows, contractRows, adLeadRows] = await Promise.all([
+        readSheet(leadsFile), readSheet(contractsFile), adLeadsFile ? readSheet(adLeadsFile) : Promise.resolve(null),
+      ]);
 
       const lh = findHeaderRow(leadRows, "телефон");
       if (lh < 0) throw new Error("В «Отчёте по Лидам» не найдена колонка «Телефон» — проверьте файл");
@@ -1622,11 +1629,42 @@ function SalesReconcile() {
 
       if (!parsedLeads.length) throw new Error("Не удалось прочитать ни одной строки лидов — проверьте файл");
       if (!parsedContracts.length) throw new Error("Не удалось прочитать ни одной строки договоров — проверьте файл");
+
+      let parsedAdLeads: AdLeadRow[] | null = null;
+      if (adLeadRows) {
+        const ah = findHeaderRow(adLeadRows, "phone") >= 0 ? findHeaderRow(adLeadRows, "phone") : findHeaderRow(adLeadRows, "телефон");
+        if (ah < 0) throw new Error("В выгрузке из Центра лидов не найдена колонка с телефоном (phone_number / Телефон)");
+        const aHeaders = buildHeaders(adLeadRows, ah);
+        const aCol = {
+          phone: findCol(aHeaders, "phone_number", "phone", "телефон"),
+          campaign: findCol(aHeaders, "campaign_name", "название кампании", "кампания"),
+          adset: findCol(aHeaders, "adset_name", "название группы", "группа объявлений"),
+          ad: findCol(aHeaders, "ad_name", "название объявления"),
+          date: findCol(aHeaders, "created_time", "дата создания", "дата"),
+        };
+        parsedAdLeads = [];
+        for (let i = ah + 1; i < adLeadRows.length; i++) {
+          const r = adLeadRows[i];
+          if (!r || !r.some((c) => c !== "" && c != null)) continue;
+          for (const phone of normPhones(r[aCol.phone])) {
+            parsedAdLeads.push({
+              phone,
+              campaign: String(r[aCol.campaign] ?? "").trim() || "—",
+              adset: String(r[aCol.adset] ?? "").trim(),
+              ad: String(r[aCol.ad] ?? "").trim(),
+              date: String(r[aCol.date] ?? "").trim(),
+            });
+          }
+        }
+        if (!parsedAdLeads.length) throw new Error("Не удалось прочитать ни одной строки из выгрузки Центра лидов — проверьте файл");
+      }
+
       setLeads(parsedLeads);
       setContracts(parsedContracts);
+      setAdLeads(parsedAdLeads);
     } catch (e) {
       setErr((e as Error).message);
-      setLeads(null); setContracts(null);
+      setLeads(null); setContracts(null); setAdLeads(null);
     }
     setLoading(false);
   };
@@ -1656,6 +1694,34 @@ function SalesReconcile() {
   for (const [channel, cnt] of Object.entries(leadsPerChannel)) {
     if (!recon[channel]) recon[channel] = { channel, leadsTotal: cnt, deals: 0, sum: 0 };
   }
+
+  // То же самое, но по данным Центра лидов (телефон + реальное название кампании из
+  // рекламного кабинета) — точнее, чем ручное поле "Канал лида" в CRM, но требует
+  // отдельной выгрузки и покрывает только лиды, пришедшие через встроенные формы.
+  const adLeadByPhone = new Map<string, AdLeadRow>();
+  for (const l of adLeads ?? []) {
+    const prev = adLeadByPhone.get(l.phone);
+    if (!prev || l.date >= prev.date) adLeadByPhone.set(l.phone, l);
+  }
+  const adMatched: { contract: ContractRow; adLead: AdLeadRow | null }[] = (contracts ?? []).map((c) => {
+    const adLead = c.phones.map((p) => adLeadByPhone.get(p)).find((l) => l) ?? null;
+    return { contract: c, adLead: adLead ?? null };
+  });
+  const adRecon: Record<string, AdReconRow> = {};
+  const leadsPerCampaign: Record<string, number> = {};
+  for (const l of adLeads ?? []) leadsPerCampaign[l.campaign] = (leadsPerCampaign[l.campaign] ?? 0) + 1;
+  for (const { contract, adLead } of adMatched) {
+    if (!adLead) continue; // без совпадения с рекламным лидом — не относим ни к одной кампании
+    const key = adLead.campaign;
+    const row = (adRecon[key] ??= { campaign: key, leadsTotal: leadsPerCampaign[key] ?? 0, deals: 0, sum: 0 });
+    row.deals += 1;
+    if (!/растор/i.test(contract.status)) row.sum += contract.sum;
+  }
+  for (const [campaign, cnt] of Object.entries(leadsPerCampaign)) {
+    if (!adRecon[campaign]) adRecon[campaign] = { campaign, leadsTotal: cnt, deals: 0, sum: 0 };
+  }
+  const adReconRows = Object.values(adRecon).sort((a, b) => b.sum - a.sum);
+  const adTotalMatched = adMatched.filter((m) => m.adLead).length;
   const reconRows = Object.values(recon).sort((a, b) => b.sum - a.sum);
 
   const money = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
@@ -1672,6 +1738,9 @@ function SalesReconcile() {
         <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
           Загрузите «Отчёт по Лидам» (телефон + канал) и «Реестр договоров» (телефон + сумма) за один и тот же период —
           сопоставление идёт по номеру телефона, без обращения к API рекламных площадок.
+          Опционально — выгрузка из <b>Центра лидов</b> рекламного кабинета (Meta Ads Manager → Публикация → Центр лидов →
+          Экспорт, .csv/.xlsx, там уже есть телефон + название кампании/группы/объявления): она точнее ручного поля
+          «Канал лида» в CRM, так как не зависит от того, что вписал оператор.
         </div>
         <div className="controls">
           <div className="field">
@@ -1681,6 +1750,10 @@ function SalesReconcile() {
           <div className="field">
             <label>Реестр договоров (.xlsx)</label>
             <input type="file" accept=".xlsx,.xls" onChange={(e) => setContractsFile(e.target.files?.[0] ?? null)} />
+          </div>
+          <div className="field">
+            <label>Центр лидов (.csv/.xlsx, опционально)</label>
+            <input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => setAdLeadsFile(e.target.files?.[0] ?? null)} />
           </div>
           <button className="btn" onClick={run} disabled={loading} style={{ alignSelf: "end" }}>
             {loading ? "⏳ Обрабатываю…" : "Сверить"}
@@ -1719,6 +1792,35 @@ function SalesReconcile() {
               </table>
             </div>
           </div>
+
+          {adLeads && (
+            <div className="panel">
+              <div className="panel-title">По кампаниям (данные Центра лидов — точное совпадение по телефону)</div>
+              <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+                Лидов в выгрузке: {adLeads.length}. Договоров с совпадением по телефону: {adTotalMatched} из {(contracts ?? []).length}.
+              </div>
+              <div className="table-scroll">
+                <table>
+                  <thead><tr><th>Кампания</th><th>Лидов</th><th>Сделок</th><th>Конверсия в сделку</th><th>Сумма договоров</th></tr></thead>
+                  <tbody>
+                    {adReconRows.map((r) => (
+                      <tr key={r.campaign}>
+                        <td>{r.campaign}</td>
+                        <td>{r.leadsTotal || "—"}</td>
+                        <td>{r.deals}</td>
+                        <td>{r.leadsTotal ? ((r.deals / r.leadsTotal) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
+                        <td>{money(r.sum)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+                Здесь показаны только договоры, чей телефон нашёлся напрямую в выгрузке Центра лидов — то есть реально пришёл
+                через рекламное объявление, без участия ручного тегирования канала в CRM.
+              </div>
+            </div>
+          )}
 
           <div className="panel">
             <div className="panel-title" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>

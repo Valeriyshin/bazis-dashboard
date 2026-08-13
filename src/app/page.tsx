@@ -1718,12 +1718,20 @@ function SalesReconcile() {
     });
   }, []);
 
+  // Если колонка не нашлась, а строк подозрительно мало — вероятно, файл не битый,
+  // а браузер не смог полностью разобрать очень большой .xlsx (собрал только обрывок).
+  // Так уже бывало на файлах с разжатым XML-листом за 600+ МБ — .xlsx на диске всего
+  // 40-50 МБ, но при чтении раздувается в разы, и на таком объёме парсер молча падает.
+  const sizeHint = (rows: SheetRow[]) => rows.length < 50
+    ? " Строк прочиталось подозрительно мало — возможно, файл слишком большой и браузер не осилил его целиком (такое бывает даже при 40-50 МБ на диске, если внутри много обращений). Попробуйте разбить выгрузку на более мелкие части — по кварталам, а не по годам."
+    : "";
+
   // Разбор одного файла "Отчёт по Лидам" → строки лидов. Вызывается по одному файлу
   // за раз (для нескольких файлов — конкатенируем результаты), чтобы не пришлось
   // держать в памяти сразу несколько сырых workbook-ов.
   function parseLeadsSheet(leadRows: SheetRow[], filename: string): LeadRow[] {
     const lh = findHeaderRow(leadRows, "телефон");
-    if (lh < 0) throw new Error(`В файле «${filename}» не найдена колонка «Телефон» — это точно «Отчёт по Лидам»?`);
+    if (lh < 0) throw new Error(`В файле «${filename}» не найдена колонка «Телефон» — это точно «Отчёт по Лидам»?${sizeHint(leadRows)}`);
     const lHeaders = buildHeaders(leadRows, lh);
     const lCol = {
       phone: findCol(lHeaders, "телефон"),
@@ -1764,7 +1772,7 @@ function SalesReconcile() {
 
   function parseContractsSheet(contractRows: SheetRow[], filename: string): ContractRow[] {
     const ch = findHeaderRow(contractRows, "телефон");
-    if (ch < 0) throw new Error(`В файле «${filename}» не найдена колонка «Телефоны» — это точно «Реестр договоров»?`);
+    if (ch < 0) throw new Error(`В файле «${filename}» не найдена колонка «Телефоны» — это точно «Реестр договоров»?${sizeHint(contractRows)}`);
     const cHeaders = buildHeaders(contractRows, ch);
     const cCol = {
       phones: findCol(cHeaders, "телефон"),
@@ -1796,7 +1804,7 @@ function SalesReconcile() {
 
   function parseAdLeadsSheet(adLeadRows: SheetRow[], filename: string): AdLeadRow[] {
     const ah = findHeaderRow(adLeadRows, "phone") >= 0 ? findHeaderRow(adLeadRows, "phone") : findHeaderRow(adLeadRows, "телефон");
-    if (ah < 0) throw new Error(`В файле «${filename}» не найдена колонка с телефоном (phone_number / Телефон)`);
+    if (ah < 0) throw new Error(`В файле «${filename}» не найдена колонка с телефоном (phone_number / Телефон)${sizeHint(adLeadRows)}`);
     const aHeaders = buildHeaders(adLeadRows, ah);
     const aCol = {
       // Выгрузка Центра лидов бывает двух видов: "родная" из Ads Manager

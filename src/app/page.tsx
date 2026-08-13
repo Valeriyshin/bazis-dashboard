@@ -1605,7 +1605,7 @@ async function readSheet(file: File): Promise<SheetRow[]> {
 }
 
 interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string; meeting: boolean }
-interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string; propType: string }
+interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string; propType: string; number: string }
 interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: number }
 interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string; client: string }
 
@@ -1690,6 +1690,64 @@ function SalesReconcile() {
   const contracts = allContracts && apartmentsOnly
     ? allContracts.filter((c) => !c.propType || /кварт/i.test(c.propType))
     : allContracts;
+
+  // Сохранение накопленных данных в Turso: загружайте выгрузки постепенно (по кварталу/
+  // полугодию), они копятся в базе с дедупликацией — а сверку потом можно делать по любому
+  // периоду сразу из базы, без повторной загрузки файлов.
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [dbRanges, setDbRanges] = useState<{ kind: string; minD: string; maxD: string; n: number }[]>([]);
+  const [dbSince, setDbSince] = useState("");
+  const [dbUntil, setDbUntil] = useState("");
+  const [loadingDb, setLoadingDb] = useState(false);
+  const refreshDbRanges = () => {
+    fetch("/api/sales-recon?kind=lead").then((r) => r.json()).then((d) => setDbRanges(d.ranges ?? [])).catch(() => {});
+  };
+  useEffect(refreshDbRanges, []);
+
+  const saveToDb = async () => {
+    if (!leads || !allContracts) return;
+    setSaving(true); setSaveMsg(null);
+    try {
+      const jobs: [string, unknown[]][] = [["lead", leads], ["contract", allContracts]];
+      if (adLeads) jobs.push(["adlead", adLeads]);
+      const results: string[] = [];
+      for (const [kind, rows] of jobs) {
+        const res = await fetch("/api/sales-recon", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ kind, rows }),
+        });
+        const j = await res.json();
+        if (!res.ok) throw new Error(j.error || res.statusText);
+        const label = kind === "lead" ? "лидов" : kind === "contract" ? "договоров" : "рекламных лидов";
+        results.push(`${label}: +${j.inserted} новых, ${j.skippedDuplicates} уже было`);
+      }
+      setSaveMsg(results.join(" · "));
+      refreshDbRanges();
+    } catch (e) {
+      setSaveMsg("Ошибка сохранения: " + (e as Error).message);
+    }
+    setSaving(false);
+  };
+
+  const loadFromDb = async () => {
+    setLoadingDb(true); setErr(null);
+    try {
+      const qs = new URLSearchParams();
+      if (dbSince) qs.set("since", dbSince);
+      if (dbUntil) qs.set("until", dbUntil);
+      const res = await fetch("/api/sales-recon?" + qs.toString());
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      if (!j.lead?.length || !j.contract?.length) throw new Error("За этот период в базе нет данных — сначала сохраните выгрузки кнопкой «Сохранить в базу», либо расширьте период");
+      setLeads(j.lead);
+      setAllContracts(j.contract);
+      setAdLeads(j.adlead?.length ? j.adlead : null);
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setLoadingDb(false);
+  };
   // Показы/охват/клики для воронки берём из уже синхронизированных рекламных кабинетов.
   const [adsByZhk, setAdsByZhk] = useState<Record<string, { reach: number; clicks: number }> | null>(null);
   const [adsPeriod, setAdsPeriod] = useState<string>("");
@@ -1783,6 +1841,7 @@ function SalesReconcile() {
       client: findCol(cHeaders, "наименование", "клиент"),
       city: findCol(cHeaders, "город"),
       propType: findCol(cHeaders, "имущество"),
+      number: findCol(cHeaders, "номер"),
     };
     const out: ContractRow[] = [];
     for (let i = ch + 1; i < contractRows.length; i++) {
@@ -1797,6 +1856,7 @@ function SalesReconcile() {
         client: String(r[cCol.client] ?? "").trim(),
         city: String(r[cCol.city] ?? "").trim(),
         propType: cCol.propType >= 0 ? String(r[cCol.propType] ?? "").trim() : "",
+        number: cCol.number >= 0 ? String(r[cCol.number] ?? "").trim() : "",
       });
     }
     return out;
@@ -2157,6 +2217,37 @@ function SalesReconcile() {
           Только квартиры (исключить машиноместа/кладовки/офисы из «Реестра договоров»)
         </label>
         {err && <div className="err" style={{ marginTop: 10 }}>{err}</div>}
+        {leads && allContracts && (
+          <div style={{ marginTop: 10 }}>
+            <button className="btn" onClick={saveToDb} disabled={saving}>
+              {saving ? "⏳ Сохраняю…" : "💾 Сохранить эту выгрузку в базу"}
+            </button>
+            {saveMsg && <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>{saveMsg}</div>}
+          </div>
+        )}
+      </div>
+
+      <div className="panel">
+        <div className="panel-title">Сверка по периоду — из базы (без повторной загрузки файлов)</div>
+        <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+          Загружайте выгрузки постепенно (по кварталу/полугодию), сохраняйте каждую кнопкой выше — данные копятся
+          в базе с дедупликацией (повторная загрузка того же периода не создаёт дублей). Отсюда сверку можно
+          сделать сразу за любой сохранённый период, не держа все файлы под рукой.
+        </div>
+        {dbRanges.length > 0 ? (
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+            В базе: {dbRanges.map((r) => `${r.kind === "lead" ? "лиды" : r.kind === "contract" ? "договоры" : "рекл. лиды"} ${r.minD}–${r.maxD} (${r.n})`).join(" · ")}
+          </div>
+        ) : (
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>В базе пока ничего не сохранено.</div>
+        )}
+        <div className="controls">
+          <div className="field"><label>С</label><input type="date" value={dbSince} onChange={(e) => setDbSince(e.target.value)} /></div>
+          <div className="field"><label>По</label><input type="date" value={dbUntil} onChange={(e) => setDbUntil(e.target.value)} /></div>
+          <button className="btn" onClick={loadFromDb} disabled={loadingDb} style={{ alignSelf: "end" }}>
+            {loadingDb ? "⏳ Загружаю…" : "Сверить за период из базы"}
+          </button>
+        </div>
       </div>
 
       {leads && contracts && (

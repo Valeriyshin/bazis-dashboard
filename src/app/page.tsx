@@ -1568,10 +1568,27 @@ function findCol(headers: string[], ...keywords: string[]): number {
 }
 async function readSheet(file: File): Promise<SheetRow[]> {
   // ExcelJS падает на этих выгрузках (нет части docProps/core.xml) — читаем через xlsx (SheetJS).
+  // Для CSV — тоже через SheetJS (type:"string"): свой построчный парсер оказался хрупким
+  // на реальных данных (не выдержал битую/незакрытую кавычку в файле, склеил хвост в одну
+  // ячейку), а SheetJS такие места разбирает надёжно.
+  // Отключаем разбор стилей/формул/HTML — на больших файлах это сильно снижает пик памяти
+  // и снижает риск "Array buffer allocation failed" в браузере.
   const XLSX = await import("xlsx");
-  const wb = file.name.toLowerCase().endsWith(".csv")
-    ? XLSX.read(await file.text(), { type: "string" })
-    : XLSX.read(await file.arrayBuffer(), { type: "array" });
+  const isCsv = file.name.toLowerCase().endsWith(".csv");
+  let wb: ReturnType<typeof XLSX.read>;
+  try {
+    wb = isCsv
+      ? XLSX.read(await file.text(), { type: "string" })
+      : XLSX.read(await file.arrayBuffer(), {
+        type: "array", cellStyles: false, cellHTML: false, cellFormula: false, sheetStubs: false, WTF: false,
+      });
+  } catch (e) {
+    throw new Error(
+      `Файл «${file.name}» не удалось загрузить в браузере (не хватило памяти на файл ~${(file.size / 1024 / 1024).toFixed(0)} МБ). ` +
+      `Разбейте выгрузку на несколько файлов по периоду (например, по году) и загрузите их все сразу — можно выбрать несколько файлов в одном поле. ` +
+      `Исходная ошибка: ${(e as Error).message}`
+    );
+  }
   const ws = wb.Sheets[wb.SheetNames[0]];
   // Выгрузки этой CRM пишут в <dimension> заведомо неверный диапазон (например
   // "A1:AB15" при 4624 фактических строках), а SheetJS обрезает лист по нему —
@@ -1588,7 +1605,7 @@ async function readSheet(file: File): Promise<SheetRow[]> {
 }
 
 interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string; meeting: boolean }
-interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string }
+interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string; propType: string }
 interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: number }
 interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string; client: string }
 
@@ -1654,16 +1671,25 @@ function shortCampaign(full: string): string {
 }
 
 function SalesReconcile() {
-  const [leadsFile, setLeadsFile] = useState<File | null>(null);
-  const [contractsFile, setContractsFile] = useState<File | null>(null);
-  const [adLeadsFile, setAdLeadsFile] = useState<File | null>(null);
+  // Несколько файлов на поле — так можно разбить огромную выгрузку (например, "лиды
+  // с 2024 года") на части по году/периоду и не упереться в лимит памяти браузера
+  // на одном файле.
+  const [leadsFiles, setLeadsFiles] = useState<File[]>([]);
+  const [contractsFiles, setContractsFiles] = useState<File[]>([]);
+  const [adLeadsFiles, setAdLeadsFiles] = useState<File[]>([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [leads, setLeads] = useState<LeadRow[] | null>(null);
-  const [contracts, setContracts] = useState<ContractRow[] | null>(null);
+  const [allContracts, setAllContracts] = useState<ContractRow[] | null>(null);
   const [adLeads, setAdLeads] = useState<AdLeadRow[] | null>(null);
   const [unmatchedOnly, setUnmatchedOnly] = useState(false);
   const [groupBy, setGroupBy] = useState<GroupKey>("source");
+  // По умолчанию считаем только квартиры — машиноместа/кладовки/офисы обычно не
+  // интересуют для маркетинговой аналитики, но можно включить обратно.
+  const [apartmentsOnly, setApartmentsOnly] = useState(true);
+  const contracts = allContracts && apartmentsOnly
+    ? allContracts.filter((c) => !c.propType || /кварт/i.test(c.propType))
+    : allContracts;
   // Показы/охват/клики для воронки берём из уже синхронизированных рекламных кабинетов.
   const [adsByZhk, setAdsByZhk] = useState<Record<string, { reach: number; clicks: number }> | null>(null);
   const [adsPeriod, setAdsPeriod] = useState<string>("");
@@ -1692,131 +1718,150 @@ function SalesReconcile() {
     });
   }, []);
 
+  // Разбор одного файла "Отчёт по Лидам" → строки лидов. Вызывается по одному файлу
+  // за раз (для нескольких файлов — конкатенируем результаты), чтобы не пришлось
+  // держать в памяти сразу несколько сырых workbook-ов.
+  function parseLeadsSheet(leadRows: SheetRow[], filename: string): LeadRow[] {
+    const lh = findHeaderRow(leadRows, "телефон");
+    if (lh < 0) throw new Error(`В файле «${filename}» не найдена колонка «Телефон» — это точно «Отчёт по Лидам»?`);
+    const lHeaders = buildHeaders(leadRows, lh);
+    const lCol = {
+      phone: findCol(lHeaders, "телефон"),
+      channel: findCol(lHeaders, "канал"),
+      source: findCol(lHeaders, "источник"),
+      object: findCol(lHeaders, "объект"),
+      date: findCol(lHeaders, "дата начала", "дата"),
+      client: findCol(lHeaders, "клиент"),
+      descr: findCol(lHeaders, "описание"),
+      meeting: findCol(lHeaders, "встреча"),
+    };
+    const out: LeadRow[] = [];
+    for (let i = lh + 1; i < leadRows.length; i++) {
+      const r = leadRows[i];
+      if (!r || !r.some((c) => c !== "" && c != null)) continue;
+      const client = String(r[lCol.client] ?? "").trim();
+      const base = {
+        channel: String(r[lCol.channel] ?? "").trim() || "—",
+        source: String(r[lCol.source] ?? "").trim(),
+        object: String(r[lCol.object] ?? "").trim(),
+        date: String(r[lCol.date] ?? "").trim(),
+        client,
+        descr: String(r[lCol.descr] ?? "").trim(),
+        // «Встреча назначена» / «Встреча не назначена» — признак квалифицированного лида.
+        meeting: /встреча\s+назначена/i.test(String(r[lCol.meeting] ?? "")),
+      };
+      const phones = normPhones(r[lCol.phone]);
+      // Лид без телефона, но с ФИО тоже сохраняем: карточку могли заполнить плохо,
+      // а в договоре данные корректные — такие ловим вторым ключом (по ФИО).
+      if (!phones.length) {
+        if (nameKey(client)) out.push({ phone: "", ...base });
+        continue;
+      }
+      for (const phone of phones) out.push({ phone, ...base });
+    }
+    return out;
+  }
+
+  function parseContractsSheet(contractRows: SheetRow[], filename: string): ContractRow[] {
+    const ch = findHeaderRow(contractRows, "телефон");
+    if (ch < 0) throw new Error(`В файле «${filename}» не найдена колонка «Телефоны» — это точно «Реестр договоров»?`);
+    const cHeaders = buildHeaders(contractRows, ch);
+    const cCol = {
+      phones: findCol(cHeaders, "телефон"),
+      sum: findCol(cHeaders, "сумма договора", "сумма"),
+      zhk: findCol(cHeaders, "жк"),
+      status: findCol(cHeaders, "состояние"),
+      date: findCol(cHeaders, "дата"),
+      client: findCol(cHeaders, "наименование", "клиент"),
+      city: findCol(cHeaders, "город"),
+      propType: findCol(cHeaders, "имущество"),
+    };
+    const out: ContractRow[] = [];
+    for (let i = ch + 1; i < contractRows.length; i++) {
+      const r = contractRows[i];
+      if (!r || !r.some((c) => c !== "" && c != null)) continue;
+      out.push({
+        phones: normPhones(r[cCol.phones]),
+        sum: Number(r[cCol.sum]) || 0,
+        zhk: String(r[cCol.zhk] ?? "").trim(),
+        status: String(r[cCol.status] ?? "").trim(),
+        date: String(r[cCol.date] ?? "").trim(),
+        client: String(r[cCol.client] ?? "").trim(),
+        city: String(r[cCol.city] ?? "").trim(),
+        propType: cCol.propType >= 0 ? String(r[cCol.propType] ?? "").trim() : "",
+      });
+    }
+    return out;
+  }
+
+  function parseAdLeadsSheet(adLeadRows: SheetRow[], filename: string): AdLeadRow[] {
+    const ah = findHeaderRow(adLeadRows, "phone") >= 0 ? findHeaderRow(adLeadRows, "phone") : findHeaderRow(adLeadRows, "телефон");
+    if (ah < 0) throw new Error(`В файле «${filename}» не найдена колонка с телефоном (phone_number / Телефон)`);
+    const aHeaders = buildHeaders(adLeadRows, ah);
+    const aCol = {
+      // Выгрузка Центра лидов бывает двух видов: "родная" из Ads Manager
+      // (phone_number + campaign_name) и из лид-менеджера (Телефон + Форма +
+      // Источник + доп. номера) — поддерживаем оба набора колонок.
+      phone: findCol(aHeaders, "phone_number", "номер телефона", "телефон", "phone"),
+      phone2: findCol(aHeaders, "дополнительный номер"),
+      wa: findCol(aHeaders, "whatsapp"),
+      campaign: findCol(aHeaders, "campaign_name", "название кампании", "кампания", "форма", "form_name"),
+      adset: findCol(aHeaders, "adset_name", "название группы", "группа объявлений"),
+      ad: findCol(aHeaders, "ad_name", "название объявления"),
+      date: findCol(aHeaders, "created_time", "дата создания", "дата"),
+      client: findCol(aHeaders, "имя", "full_name", "name"),
+    };
+    const out: AdLeadRow[] = [];
+    for (let i = ah + 1; i < adLeadRows.length; i++) {
+      const r = adLeadRows[i];
+      if (!r || !r.some((c) => c !== "" && c != null)) continue;
+      const phones = new Set([
+        ...normPhones(r[aCol.phone]),
+        ...(aCol.phone2 >= 0 ? normPhones(r[aCol.phone2]) : []),
+        ...(aCol.wa >= 0 ? normPhones(r[aCol.wa]) : []),
+      ]);
+      const client = aCol.client >= 0 ? String(r[aCol.client] ?? "").trim() : "";
+      const rec = {
+        campaign: String(r[aCol.campaign] ?? "").trim() || "—",
+        adset: String(r[aCol.adset] ?? "").trim(),
+        ad: String(r[aCol.ad] ?? "").trim(),
+        date: String(r[aCol.date] ?? "").trim(),
+        client,
+      };
+      // Строка без телефона, но с именем тоже нужна: она может стать мостиком по ФИО.
+      if (!phones.size && nameKey(client)) out.push({ phone: "", ...rec });
+      for (const phone of phones) out.push({ phone, ...rec });
+    }
+    return out;
+  }
+
   const run = async () => {
-    if (!leadsFile || !contractsFile) { setErr("Загрузите хотя бы «Отчёт по Лидам» и «Реестр договоров»"); return; }
+    if (!leadsFiles.length || !contractsFiles.length) { setErr("Загрузите хотя бы «Отчёт по Лидам» и «Реестр договоров»"); return; }
     setLoading(true); setErr(null);
     try {
-      const [leadRows, contractRows, adLeadRows] = await Promise.all([
-        readSheet(leadsFile), readSheet(contractsFile), adLeadsFile ? readSheet(adLeadsFile) : Promise.resolve(null),
-      ]);
-
-      const lh = findHeaderRow(leadRows, "телефон");
-      if (lh < 0) throw new Error("В «Отчёте по Лидам» не найдена колонка «Телефон» — проверьте файл");
-      const lHeaders = buildHeaders(leadRows, lh);
-      const lCol = {
-        phone: findCol(lHeaders, "телефон"),
-        channel: findCol(lHeaders, "канал"),
-        source: findCol(lHeaders, "источник"),
-        object: findCol(lHeaders, "объект"),
-        date: findCol(lHeaders, "дата начала", "дата"),
-        client: findCol(lHeaders, "клиент"),
-        descr: findCol(lHeaders, "описание"),
-        meeting: findCol(lHeaders, "встреча"),
-      };
+      // Файлы одной категории читаем последовательно (не параллельно) — иначе на очень
+      // больших выгрузках несколько workbook-ов одновременно в памяти дадут тот же OOM,
+      // от которого мы уходим, разрешая грузить несколько файлов вместо одного гигантского.
       const parsedLeads: LeadRow[] = [];
-      for (let i = lh + 1; i < leadRows.length; i++) {
-        const r = leadRows[i];
-        if (!r || !r.some((c) => c !== "" && c != null)) continue;
-        const client = String(r[lCol.client] ?? "").trim();
-        const base = {
-          channel: String(r[lCol.channel] ?? "").trim() || "—",
-          source: String(r[lCol.source] ?? "").trim(),
-          object: String(r[lCol.object] ?? "").trim(),
-          date: String(r[lCol.date] ?? "").trim(),
-          client,
-          descr: String(r[lCol.descr] ?? "").trim(),
-          // «Встреча назначена» / «Встреча не назначена» — признак квалифицированного лида.
-          meeting: /встреча\s+назначена/i.test(String(r[lCol.meeting] ?? "")),
-        };
-        const phones = normPhones(r[lCol.phone]);
-        // Лид без телефона, но с ФИО тоже сохраняем: карточку могли заполнить плохо,
-        // а в договоре данные корректные — такие ловим вторым ключом (по ФИО).
-        if (!phones.length) {
-          if (nameKey(client)) parsedLeads.push({ phone: "", ...base });
-          continue;
-        }
-        for (const phone of phones) parsedLeads.push({ phone, ...base });
-      }
-
-      const ch = findHeaderRow(contractRows, "телефон");
-      if (ch < 0) throw new Error("В «Реестре договоров» не найдена колонка «Телефоны» — проверьте файл");
-      const cHeaders = buildHeaders(contractRows, ch);
-      const cCol = {
-        phones: findCol(cHeaders, "телефон"),
-        sum: findCol(cHeaders, "сумма договора", "сумма"),
-        zhk: findCol(cHeaders, "жк"),
-        status: findCol(cHeaders, "состояние"),
-        date: findCol(cHeaders, "дата"),
-        client: findCol(cHeaders, "наименование", "клиент"),
-        city: findCol(cHeaders, "город"),
-      };
+      for (const f of leadsFiles) parsedLeads.push(...parseLeadsSheet(await readSheet(f), f.name));
       const parsedContracts: ContractRow[] = [];
-      for (let i = ch + 1; i < contractRows.length; i++) {
-        const r = contractRows[i];
-        if (!r || !r.some((c) => c !== "" && c != null)) continue;
-        const sumRaw = r[cCol.sum];
-        parsedContracts.push({
-          phones: normPhones(r[cCol.phones]),
-          sum: Number(sumRaw) || 0,
-          zhk: String(r[cCol.zhk] ?? "").trim(),
-          status: String(r[cCol.status] ?? "").trim(),
-          date: String(r[cCol.date] ?? "").trim(),
-          client: String(r[cCol.client] ?? "").trim(),
-          city: String(r[cCol.city] ?? "").trim(),
-        });
-      }
-
-      if (!parsedLeads.length) throw new Error("Не удалось прочитать ни одной строки лидов — проверьте файл");
-      if (!parsedContracts.length) throw new Error("Не удалось прочитать ни одной строки договоров — проверьте файл");
-
+      for (const f of contractsFiles) parsedContracts.push(...parseContractsSheet(await readSheet(f), f.name));
       let parsedAdLeads: AdLeadRow[] | null = null;
-      if (adLeadRows) {
-        const ah = findHeaderRow(adLeadRows, "phone") >= 0 ? findHeaderRow(adLeadRows, "phone") : findHeaderRow(adLeadRows, "телефон");
-        if (ah < 0) throw new Error("В выгрузке из Центра лидов не найдена колонка с телефоном (phone_number / Телефон)");
-        const aHeaders = buildHeaders(adLeadRows, ah);
-        const aCol = {
-          // Выгрузка Центра лидов бывает двух видов: "родная" из Ads Manager
-          // (phone_number + campaign_name) и из лид-менеджера (Телефон + Форма +
-          // Источник + доп. номера) — поддерживаем оба набора колонок.
-          phone: findCol(aHeaders, "phone_number", "номер телефона", "телефон", "phone"),
-          phone2: findCol(aHeaders, "дополнительный номер"),
-          wa: findCol(aHeaders, "whatsapp"),
-          campaign: findCol(aHeaders, "campaign_name", "название кампании", "кампания", "форма", "form_name"),
-          adset: findCol(aHeaders, "adset_name", "название группы", "группа объявлений"),
-          ad: findCol(aHeaders, "ad_name", "название объявления"),
-          date: findCol(aHeaders, "created_time", "дата создания", "дата"),
-          client: findCol(aHeaders, "имя", "full_name", "name"),
-        };
+      if (adLeadsFiles.length) {
         parsedAdLeads = [];
-        for (let i = ah + 1; i < adLeadRows.length; i++) {
-          const r = adLeadRows[i];
-          if (!r || !r.some((c) => c !== "" && c != null)) continue;
-          const phones = new Set([
-            ...normPhones(r[aCol.phone]),
-            ...(aCol.phone2 >= 0 ? normPhones(r[aCol.phone2]) : []),
-            ...(aCol.wa >= 0 ? normPhones(r[aCol.wa]) : []),
-          ]);
-          const client = aCol.client >= 0 ? String(r[aCol.client] ?? "").trim() : "";
-          const rec = {
-            campaign: String(r[aCol.campaign] ?? "").trim() || "—",
-            adset: String(r[aCol.adset] ?? "").trim(),
-            ad: String(r[aCol.ad] ?? "").trim(),
-            date: String(r[aCol.date] ?? "").trim(),
-            client,
-          };
-          // Строка без телефона, но с именем тоже нужна: она может стать мостиком по ФИО.
-          if (!phones.size && nameKey(client)) parsedAdLeads.push({ phone: "", ...rec });
-          for (const phone of phones) parsedAdLeads.push({ phone, ...rec });
-        }
-        if (!parsedAdLeads.length) throw new Error("Не удалось прочитать ни одной строки из выгрузки Центра лидов — проверьте файл");
+        for (const f of adLeadsFiles) parsedAdLeads.push(...parseAdLeadsSheet(await readSheet(f), f.name));
       }
+
+      if (!parsedLeads.length) throw new Error("Не удалось прочитать ни одной строки лидов — проверьте файл(ы)");
+      if (!parsedContracts.length) throw new Error("Не удалось прочитать ни одной строки договоров — проверьте файл(ы)");
+      if (parsedAdLeads && !parsedAdLeads.length) throw new Error("Не удалось прочитать ни одной строки из выгрузки Центра лидов — проверьте файл(ы)");
 
       setLeads(parsedLeads);
-      setContracts(parsedContracts);
+      setAllContracts(parsedContracts);
       setAdLeads(parsedAdLeads);
     } catch (e) {
       setErr((e as Error).message);
-      setLeads(null); setContracts(null); setAdLeads(null);
+      setLeads(null); setAllContracts(null); setAdLeads(null);
     }
     setLoading(false);
   };
@@ -2076,24 +2121,33 @@ function SalesReconcile() {
           <br /><b>Как считается:</b> по каждому договору ищем лид — сначала по телефону, если не нашли — по ФИО.
           У найденного лида берём кампанию из поля «Описание» (по всем его обращениям, самое раннее заполненное),
           источник и канал. Выгрузка кабинета — отдельная разрезка, она не расширяет охват сопоставления.
+          <br />Если файл большой и браузер выдаёт ошибку памяти — разбейте выгрузку на несколько частей по периоду
+          (например, по году) и выберите сразу все части в одном поле — можно отмечать несколько файлов.
         </div>
         <div className="controls">
           <div className="field">
-            <label>Отчёт по Лидам (.xlsx)</label>
-            <input type="file" accept=".xlsx,.xls" onChange={(e) => setLeadsFile(e.target.files?.[0] ?? null)} />
+            <label>Отчёт по Лидам (.xlsx, можно несколько)</label>
+            <input type="file" accept=".xlsx,.xls" multiple onChange={(e) => setLeadsFiles(Array.from(e.target.files ?? []))} />
+            {leadsFiles.length > 0 && <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{leadsFiles.map((f) => f.name).join(", ")}</div>}
           </div>
           <div className="field">
-            <label>Реестр договоров (.xlsx)</label>
-            <input type="file" accept=".xlsx,.xls" onChange={(e) => setContractsFile(e.target.files?.[0] ?? null)} />
+            <label>Реестр договоров (.xlsx, можно несколько)</label>
+            <input type="file" accept=".xlsx,.xls" multiple onChange={(e) => setContractsFiles(Array.from(e.target.files ?? []))} />
+            {contractsFiles.length > 0 && <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{contractsFiles.map((f) => f.name).join(", ")}</div>}
           </div>
           <div className="field">
-            <label>Центр лидов (.csv/.xlsx, опционально)</label>
-            <input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => setAdLeadsFile(e.target.files?.[0] ?? null)} />
+            <label>Центр лидов (.csv/.xlsx, опционально, можно несколько)</label>
+            <input type="file" accept=".xlsx,.xls,.csv" multiple onChange={(e) => setAdLeadsFiles(Array.from(e.target.files ?? []))} />
+            {adLeadsFiles.length > 0 && <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{adLeadsFiles.map((f) => f.name).join(", ")}</div>}
           </div>
           <button className="btn" onClick={run} disabled={loading} style={{ alignSelf: "end" }}>
             {loading ? "⏳ Обрабатываю…" : "Сверить"}
           </button>
         </div>
+        <label style={{ fontSize: 12, display: "flex", gap: 6, alignItems: "center", cursor: "pointer", marginTop: 10 }}>
+          <input type="checkbox" checked={apartmentsOnly} onChange={(e) => setApartmentsOnly(e.target.checked)} />
+          Только квартиры (исключить машиноместа/кладовки/офисы из «Реестра договоров»)
+        </label>
         {err && <div className="err" style={{ marginTop: 10 }}>{err}</div>}
       </div>
 

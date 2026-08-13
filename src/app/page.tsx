@@ -10,6 +10,7 @@ import {
   METRICS, METRIC_BY_KEY, DEFAULT_KPI_KEYS, DailyRow,
   sumRows, metricValue, formatMetric, delta,
 } from "@/lib/metrics";
+import type { ReconciliationResult } from "@/lib/salesRecon";
 
 interface Entity {
   campaign_id?: string; adset_id?: string; ad_id?: string; name: string; status: string;
@@ -1756,19 +1757,23 @@ function SalesReconcile() {
     setSaving(false);
   };
 
-  const loadFromDb = async () => {
-    setLoadingDb(true); setErr(null);
+  // Сверка по периоду из базы считается ЦЕЛИКОМ на сервере (/api/sales-recon/aggregate):
+  // сырые строки (могут быть сотни тысяч) не покидают сервер — оттуда едет уже готовый
+  // агрегат (KPI, разрезка по источникам, воронка по ЖК, когортный анализ), поэтому
+  // ограничение в 80 000 строк на "сырой" эндпоинт здесь не действует — можно сверять
+  // весь накопленный период разом.
+  const [dbAgg, setDbAgg] = useState<ReconciliationResult | null>(null);
+  const [dbGroupBy, setDbGroupBy] = useState<GroupKey>("source");
+  const loadAggFromDb = async () => {
+    setLoadingDb(true); setErr(null); setDbAgg(null);
     try {
       const qs = new URLSearchParams();
       if (dbSince) qs.set("since", dbSince);
       if (dbUntil) qs.set("until", dbUntil);
-      const j = await getJson("/api/sales-recon?" + qs.toString());
-      if (!j.lead || !(j.lead as unknown[]).length || !j.contract || !(j.contract as unknown[]).length)
-        throw new Error("За этот период в базе нет данных — сначала сохраните выгрузки кнопкой «Сохранить в базу», либо расширьте период");
-      setLeads(j.lead as LeadRow[]);
-      setAllContracts(j.contract as ContractRow[]);
-      const adl = j.adlead as unknown[] | undefined;
-      setAdLeads(adl?.length ? (adl as AdLeadRow[]) : null);
+      qs.set("groupBy", dbGroupBy);
+      qs.set("apartmentsOnly", apartmentsOnly ? "1" : "0");
+      const j = await getJson("/api/sales-recon/aggregate?" + qs.toString());
+      setDbAgg(j as unknown as ReconciliationResult);
     } catch (e) {
       setErr((e as Error).message);
     }
@@ -2270,10 +2275,124 @@ function SalesReconcile() {
         <div className="controls">
           <div className="field"><label>С</label><input type="date" value={dbSince} onChange={(e) => setDbSince(e.target.value)} /></div>
           <div className="field"><label>По</label><input type="date" value={dbUntil} onChange={(e) => setDbUntil(e.target.value)} /></div>
-          <button className="btn" onClick={loadFromDb} disabled={loadingDb} style={{ alignSelf: "end" }}>
-            {loadingDb ? "⏳ Загружаю…" : "Сверить за период из базы"}
+          <button className="btn" onClick={loadAggFromDb} disabled={loadingDb} style={{ alignSelf: "end" }}>
+            {loadingDb ? "⏳ Считаю на сервере…" : "Сверить за период из базы"}
           </button>
         </div>
+        <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+          Считается сервером по всем строкам периода целиком (не ограничено 80 000 строк — это ограничение только
+          для скачивания сырых строк в браузер). Можно оставить «С»/«По» пустыми — тогда сверка пойдёт по всему
+          накопленному периоду сразу.
+        </div>
+        {dbAgg && (
+          <div style={{ marginTop: 16 }}>
+            <div className="kpi-grid">
+              <div className="kpi"><div className="label">Лидов (уник. телефонов)</div><div className="value">{dbAgg.kpis.leadsUnique.toLocaleString("ru-RU")}</div><div className="delta neutral">строк в выгрузке: {dbAgg.kpis.leadsRows.toLocaleString("ru-RU")}</div></div>
+              <div className="kpi"><div className="label">Договоров</div><div className="value">{dbAgg.kpis.totalDeals.toLocaleString("ru-RU")}</div><div className="delta neutral">из них без телефона: {dbAgg.kpis.noPhone}</div></div>
+              <div className="kpi"><div className="label">Сопоставлено с лидом</div><div className="value">{dbAgg.kpis.totalMatched.toLocaleString("ru-RU")} ({dbAgg.kpis.matchedPct}%)</div><div className="delta neutral">телефон: {dbAgg.kpis.matchedByPhone} · ФИО: {dbAgg.kpis.matchedByName} · кабинет: {dbAgg.kpis.matchedByAds}</div></div>
+              <div className="kpi"><div className="label">Обращение после сделки</div><div className="value">{dbAgg.kpis.matchedLate}</div><div className="delta neutral">не считаем источником привлечения</div></div>
+              <div className="kpi"><div className="label">Сумма договоров (без расторгнутых)</div><div className="value">{money(dbAgg.kpis.totalSum)}</div></div>
+            </div>
+
+            <div style={{ marginTop: 16 }}>
+              <div className="panel-title">Когортный анализ: цикл сделки</div>
+              <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+                Когорта — месяц первого обращения клиента. Медиана и разбивка по срокам — по всем {dbAgg.cycleSamples.toLocaleString("ru-RU")} договорам периода с найденным обращением до даты подписания.
+              </div>
+              <div className="kpi-grid" style={{ marginBottom: 14 }}>
+                <div className="kpi"><div className="label">Медиана цикла сделки</div><div className="value">{dbAgg.overallMedian} дн.</div></div>
+                <div className="kpi"><div className="label">Среднее</div><div className="value">{dbAgg.overallAvg.toFixed(0)} дн.</div></div>
+                <div className="kpi"><div className="label">Договоров в расчёте</div><div className="value">{dbAgg.cycleSamples.toLocaleString("ru-RU")}</div></div>
+              </div>
+              <div className="table-scroll">
+                <table>
+                  <thead><tr>
+                    <th>Когорта (месяц лида)</th><th>Лидов→договор</th>
+                    {CYCLE_BUCKETS.map((b) => <th key={b.key}>{b.label}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {dbAgg.cohortRows.map((r) => (
+                      <tr key={r.month}>
+                        <td>{r.month}</td>
+                        <td>{r.total}</td>
+                        {CYCLE_BUCKETS.map((b) => (
+                          <td key={b.key}>
+                            {r.buckets[b.key] || "—"}
+                            {r.buckets[b.key] > 0 && <span className="muted" style={{ fontSize: 11 }}> ({((r.buckets[b.key] / r.total) * 100).toFixed(0)}%)</span>}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 16 }}>
+              <div className="panel-title">Продажи по источникам</div>
+              <div className="chips" style={{ marginBottom: 4 }}>
+                {GROUP_BY.map((g) => (
+                  <div key={g.key} className={"chip" + (dbGroupBy === g.key ? " on" : "")}
+                    onClick={() => setDbGroupBy(g.key)} title={g.hint}>{g.label}</div>
+                ))}
+              </div>
+              <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+                {GROUP_BY.find((g) => g.key === dbGroupBy)?.hint} · после смены разрезки нажмите «Сверить за период из базы» ещё раз.
+              </div>
+              <div className="table-scroll">
+                <table>
+                  <thead><tr><th>{GROUP_BY.find((g) => g.key === dbGroupBy)?.label}</th><th>Лидов (уник.)</th><th>Покупателей</th><th>Договоров</th><th>Конверсия лид→покупатель</th><th>Сумма договоров</th></tr></thead>
+                  <tbody>
+                    {dbAgg.reconRows.map((r) => (
+                      <tr key={r.channel} style={(r.channel === NOT_FOUND || r.channel === LATE_TOUCH) ? { color: "var(--muted)" } : undefined}>
+                        <td>{r.channel}</td>
+                        <td>{r.leadsTotal || "—"}</td>
+                        <td>{r.buyers}</td>
+                        <td>{r.deals}</td>
+                        <td>{r.leadsTotal ? ((r.buyers / r.leadsTotal) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" : "—"}</td>
+                        <td>{money(r.sum)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 16 }}>
+              <div className="panel-title">Воронка по ЖК</div>
+              <div className="table-scroll">
+                <table>
+                  <thead><tr>
+                    <th>ЖК</th><th>Охват</th><th>Клики</th><th>Лиды</th><th>Квал-лиды</th>
+                    <th>Купили из квал-лидов</th><th>Покупателей всего</th><th>Договоров</th><th>Сумма</th>
+                  </tr></thead>
+                  <tbody>
+                    {dbAgg.funnelRows.map((r) => (
+                      <tr key={r.zhk}>
+                        <td>{r.zhk}</td>
+                        <td>{r.reach ? int0(r.reach) : "—"}</td>
+                        <td>{r.clicks ? int0(r.clicks) : "—"}</td>
+                        <td>{r.leads || "—"}</td>
+                        <td>{r.qual || "—"}</td>
+                        <td>{r.buyersQual || "—"}</td>
+                        <td>{r.buyers || "—"}</td>
+                        <td>{r.deals || "—"}</td>
+                        <td>{r.sum ? money(r.sum) : "—"}</td>
+                      </tr>
+                    ))}
+                    <tr style={{ fontWeight: 700, background: "var(--panel-2)" }}>
+                      <td>Итого</td>
+                      <td>{int0(dbAgg.funnelTotal.reach)}</td><td>{int0(dbAgg.funnelTotal.clicks)}</td>
+                      <td>{dbAgg.funnelTotal.leads}</td><td>{dbAgg.funnelTotal.qual}</td>
+                      <td>{dbAgg.funnelTotal.buyersQual}</td><td>{dbAgg.funnelTotal.buyers}</td>
+                      <td>{dbAgg.funnelTotal.deals}</td><td>{money(dbAgg.funnelTotal.sum)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {leads && contracts && (

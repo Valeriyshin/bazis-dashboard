@@ -84,13 +84,35 @@ export async function GET(req: NextRequest) {
     const since = req.nextUrl.searchParams.get("since") || "";
     const until = req.nextUrl.searchParams.get("until") || "";
     const out: Record<string, Record<string, unknown>[]> = {};
+    const LIMIT_ROWS = 80000; // ~15-20 МБ JSON на "лиды" — за этим порогом браузер уже падал на файлах того же размера
     for (const kind of kinds) {
-      let sql = "SELECT data FROM sales_recon_rows WHERE kind=?";
-      const args: (string | number)[] = [kind];
-      if (since) { sql += " AND date_iso >= ?"; args.push(since); }
-      if (until) { sql += " AND date_iso <= ?"; args.push(until); }
-      const rs = await db.execute({ sql, args });
-      out[kind] = rowsToObjects(rs).map((r) => JSON.parse(String(r.data)));
+      const baseWhere = ["kind=?"];
+      const baseArgs: (string | number)[] = [kind];
+      if (since) { baseWhere.push("date_iso >= ?"); baseArgs.push(since); }
+      if (until) { baseWhere.push("date_iso <= ?"); baseArgs.push(until); }
+      const cnt = await db.execute({ sql: `SELECT COUNT(*) AS n FROM sales_recon_rows WHERE ${baseWhere.join(" AND ")}`, args: baseArgs });
+      const total = Number(rowsToObjects(cnt)[0]?.n ?? 0);
+      if (total > LIMIT_ROWS) {
+        return NextResponse.json({
+          error: `За выбранный период в базе ${total.toLocaleString("ru-RU")} строк «${kind === "lead" ? "лиды" : kind === "contract" ? "договоры" : "рекламные лиды"}» — это больше, чем браузер может принять и разобрать за один раз (лимит ~${LIMIT_ROWS.toLocaleString("ru-RU")}). Сузьте период (например, до квартала) и сверяйте частями.`,
+        }, { status: 413 });
+      }
+      let sql = `SELECT id, data FROM sales_recon_rows WHERE ${baseWhere.join(" AND ")}`;
+      const args = baseArgs;
+      // Даже в пределах лимита читаем постранично по id, а не одним SELECT: сама Turso
+      // (Hrana-протокол) роняет большой единый ответ с SQLITE_UNKNOWN: Resource exhausted.
+      sql += " AND id > ? ORDER BY id LIMIT 20000";
+      const rows: Record<string, unknown>[] = [];
+      let lastId = 0;
+      for (;;) {
+        const rs = await db.execute({ sql, args: [...args, lastId] });
+        const page = rowsToObjects(rs);
+        if (!page.length) break;
+        for (const r of page) rows.push(JSON.parse(String(r.data)));
+        lastId = Number(page[page.length - 1].id);
+        if (page.length < 20000) break;
+      }
+      out[kind] = rows;
     }
     // Диапазон дат, реально накопленных в базе — чтобы показать пользователю на UI.
     const rangeRs = await db.execute("SELECT kind, MIN(date_iso) AS minD, MAX(date_iso) AS maxD, COUNT(*) AS n FROM sales_recon_rows WHERE date_iso != '' GROUP BY kind");

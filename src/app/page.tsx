@@ -1523,6 +1523,11 @@ function sortableDate(s: string): string {
   const m = String(s).match(/(\d{2})[.\-/](\d{2})[.\-/](\d{4})/);
   return m ? m[3] + m[2] + m[1] : "99999999";
 }
+// Выгрузка Центра лидов датируется в американском формате "08/12/2026 5:15am" (ММ/ДД/ГГГГ).
+function sortableAdDate(s: string): string {
+  const m = String(s).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  return m ? m[3] + m[1].padStart(2, "0") + m[2].padStart(2, "0") : "99999999";
+}
 
 // Строка (0-индексная), в которой хотя бы одна ячейка содержит keyword — ищем заголовок.
 function findHeaderRow(rows: SheetRow[], keyword: string): number {
@@ -1588,6 +1593,7 @@ interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: nu
 interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string; client: string }
 
 const NOT_FOUND = "Лид не найден (сайт/офлайн/вне периода выгрузки)";
+const LATE_TOUCH = "Обращение только ПОСЛЕ сделки (реклама не привела)";
 const AD_SOURCE = "Реклама (по выгрузке кабинета)";
 const NO_CAMPAIGN = "Кампания не указана в карточке лида";
 const GROUP_BY = [
@@ -1757,21 +1763,46 @@ function SalesReconcile() {
   // phone → лид ПЕРВОГО касания: именно первый контакт привёл клиента, а последующие
   // обращения того же телефона — уже работа с существующим лидом.
   // Дату сравниваем как yyyymmdd: "05.06.2026" >= "12.01.2026" строкой даёт неверный порядок.
-  const leadByPhone = new Map<string, LeadRow>();
+  // Храним ВСЕ касания клиента, а не только первое: для атрибуции нужно выбрать
+  // самое раннее обращение, случившееся ДО договора. Если брать глобально первое,
+  // можно приписать источник обращению, которого на момент сделки ещё не было
+  // (клиент написал в рекламную форму уже после покупки — таких 27%).
+  const touchesByPhone = new Map<string, LeadRow[]>();
+  const touchesByName = new Map<string, LeadRow[]>();
   for (const l of leads ?? []) {
-    if (!l.phone) continue; // лиды без телефона матчим по ФИО (ниже), не по пустому ключу
-    const prev = leadByPhone.get(l.phone);
-    if (!prev || sortableDate(l.date) < sortableDate(prev.date)) leadByPhone.set(l.phone, l);
-  }
-
-  // Второй ключ — ФИО: карточку лида могли заполнить плохо (без телефона или с
-  // опечаткой), а в договоре данные корректные. Берём первое касание, как и по телефону.
-  const leadByName = new Map<string, LeadRow>();
-  for (const l of leads ?? []) {
+    if (l.phone) {
+      const arr = touchesByPhone.get(l.phone);
+      if (arr) arr.push(l); else touchesByPhone.set(l.phone, [l]);
+    }
     const k = nameKey(l.client);
-    if (!k) continue;
-    const prev = leadByName.get(k);
-    if (!prev || sortableDate(l.date) < sortableDate(prev.date)) leadByName.set(k, l);
+    if (k) {
+      const arr = touchesByName.get(k);
+      if (arr) arr.push(l); else touchesByName.set(k, [l]);
+    }
+  }
+  // Первое касание из списка, не позже даты договора (пустая дата договора — без ограничения).
+  const earliestBefore = (arr: LeadRow[] | undefined, until: string): LeadRow | null => {
+    if (!arr?.length) return null;
+    const lim = until ? sortableDate(until) : "99999999";
+    let best: LeadRow | null = null;
+    for (const l of arr) {
+      const d = sortableDate(l.date);
+      if (d > lim) continue;
+      if (!best || d < sortableDate(best.date)) best = l;
+    }
+    return best;
+  };
+  // Есть ли у клиента хоть какое-то касание (пусть и после сделки) — чтобы отличать
+  // "лида нет вовсе" от "лид есть, но появился уже после покупки".
+  const hasAnyTouch = (c: ContractRow) =>
+    c.phones.some((p) => touchesByPhone.has(p)) || touchesByName.has(nameKey(c.client));
+
+  // Для разрезок по кампании/лидам нужен ещё общий индекс "первое касание вообще".
+  const leadByPhone = new Map<string, LeadRow>();
+  for (const [phone, arr] of touchesByPhone) {
+    let best = arr[0];
+    for (const l of arr) if (sortableDate(l.date) < sortableDate(best.date)) best = l;
+    leadByPhone.set(phone, best);
   }
 
   // Индексы выгрузки Центра лидов — по телефону и по имени. Кабинет используется
@@ -1787,26 +1818,32 @@ function SalesReconcile() {
   }
   const adTotalMatched = (contracts ?? []).filter((c) => c.phones.some((p) => adLeadByPhone.has(p))).length;
 
-  const matched: { contract: ContractRow; lead: LeadRow | null; by: "phone" | "name" | "ads" | null }[] = (contracts ?? []).map((c) => {
-    const byPhone = c.phones.map((p) => leadByPhone.get(p)).find((l) => l);
-    if (byPhone) return { contract: c, lead: byPhone, by: "phone" as const };
-    const byName = leadByName.get(nameKey(c.client));
+  const matched: { contract: ContractRow; lead: LeadRow | null; by: "phone" | "name" | "ads" | "late" | null }[] = (contracts ?? []).map((c) => {
+    // Атрибутируем только по обращениям, случившимся ДО договора: если клиент написал
+    // в рекламную форму уже после покупки, реклама его не приводила.
+    for (const p of c.phones) {
+      const hit = earliestBefore(touchesByPhone.get(p), c.date);
+      if (hit) return { contract: c, lead: hit, by: "phone" as const };
+    }
+    const byName = earliestBefore(touchesByName.get(nameKey(c.client)), c.date);
     if (byName) return { contract: c, lead: byName, by: "name" as const };
-    // Третий ключ — сама выгрузка кабинета. Синтезируем лид, чтобы такой договор
-    // попал в отчёт как рекламный, а не в "не найден".
+    // Третий ключ — сама выгрузка кабинета (тоже только если лид был до сделки).
     const ad = c.phones.map((p) => adLeadByPhone.get(p)).find((l) => l) ?? adLeadByName.get(nameKey(c.client));
-    if (ad) {
+    if (ad && (!c.date || !ad.date || sortableAdDate(ad.date) <= sortableDate(c.date))) {
       return {
         contract: c,
         lead: { phone: ad.phone, channel: "Центр лидов", source: AD_SOURCE, object: "", date: ad.date, client: ad.client, descr: "" },
         by: "ads" as const,
       };
     }
+    // Касания есть, но все — после сделки. Это не "не найден", но и не источник привлечения.
+    if (hasAnyTouch(c) || ad) return { contract: c, lead: null, by: "late" as const };
     return { contract: c, lead: null, by: null };
   });
   const matchedByPhone = matched.filter((m) => m.by === "phone").length;
   const matchedByName = matched.filter((m) => m.by === "name").length;
   const matchedByAds = matched.filter((m) => m.by === "ads").length;
+  const matchedLate = matched.filter((m) => m.by === "late").length;
 
   // Кампания ищется по ВСЕМ касаниям клиента, а не только по первому: описание с
   // названием кампании может быть заполнено на любом из обращений. Берём самое раннее
@@ -1861,11 +1898,13 @@ function SalesReconcile() {
   }
 
   const recon: Record<string, ReconRow & { buyers: Set<string> }> = {};
-  for (const { contract, lead } of matched) {
-    // Договор без телефона И без совпадения по ФИО атрибутировать нечем — пропускаем,
+  for (const { contract, lead, by } of matched) {
+    // Договор без телефона И без единого касания атрибутировать нечем — пропускаем,
     // иначе он раздувал бы "не найден" тем, что мы физически не могли сопоставить.
-    if (!contract.phones.length && !lead) continue;
-    const key = lead ? groupOf(lead, contract.phones.find((p) => leadByPhone.has(p)) ?? contract.phones[0] ?? "", contract) : NOT_FOUND;
+    if (!contract.phones.length && !lead && by !== "late") continue;
+    const key = lead
+      ? groupOf(lead, contract.phones.find((p) => leadByPhone.has(p)) ?? contract.phones[0] ?? "", contract)
+      : by === "late" ? LATE_TOUCH : NOT_FOUND;
     const row = (recon[key] ??= { channel: key, leadsTotal: leadsPerGroup[key] ?? 0, deals: 0, sum: 0, buyers: new Set() });
     row.deals += 1;
     row.buyers.add(contract.phones[0] || nameKey(contract.client));
@@ -1875,9 +1914,11 @@ function SalesReconcile() {
   for (const [g, cnt] of Object.entries(leadsPerGroup)) {
     if (!recon[g]) recon[g] = { channel: g, leadsTotal: cnt, deals: 0, sum: 0, buyers: new Set() };
   }
-  // "Не найден" всегда внизу — это не источник, а остаток без атрибуции.
+  // Служебные строки ("не найден", "обращение после сделки") — всегда внизу: это не
+  // источники привлечения, а остаток, который нельзя атрибутировать.
+  const isTail = (k: string) => (k === NOT_FOUND || k === LATE_TOUCH ? 1 : 0);
   const reconRows = Object.values(recon).sort((a, b) =>
-    (a.channel === NOT_FOUND ? 1 : 0) - (b.channel === NOT_FOUND ? 1 : 0) || b.sum - a.sum);
+    isTail(a.channel) - isTail(b.channel) || b.sum - a.sum);
 
   const money = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
   const totalDeals = matched.length;
@@ -1927,6 +1968,7 @@ function SalesReconcile() {
               <div className="kpi"><div className="label">Лидов (уник. телефонов)</div><div className="value">{leadByPhone.size}</div><div className="delta neutral">строк в выгрузке: {leads.length.toLocaleString("ru-RU")}</div></div>
               <div className="kpi"><div className="label">Договоров</div><div className="value">{totalDeals}</div><div className="delta neutral">из них без телефона: {noPhone}</div></div>
               <div className="kpi"><div className="label">Сопоставлено с лидом</div><div className="value">{totalMatched} ({totalDeals ? Math.round((totalMatched / totalDeals) * 100) : 0}%)</div><div className="delta neutral">телефон: {matchedByPhone} · ФИО: {matchedByName} · кабинет: {matchedByAds}</div></div>
+              <div className="kpi"><div className="label">Обращение после сделки</div><div className="value">{matchedLate}</div><div className="delta neutral">не считаем источником привлечения</div></div>
               <div className="kpi"><div className="label">Сумма договоров (без расторгнутых)</div><div className="value">{money(totalSum)}</div></div>
             </div>
           </div>
@@ -1949,7 +1991,7 @@ function SalesReconcile() {
                 <thead><tr><th>{GROUP_BY.find((g) => g.key === groupBy)?.label}</th><th>Лидов (уник.)</th><th>Покупателей</th><th>Договоров</th><th>Конверсия лид→покупатель</th><th>Сумма договоров</th></tr></thead>
                 <tbody>
                   {reconRows.map((r) => (
-                    <tr key={r.channel} style={r.channel === NOT_FOUND ? { color: "var(--muted)" } : undefined}>
+                    <tr key={r.channel} style={isTail(r.channel) ? { color: "var(--muted)" } : undefined}>
                       <td>{r.channel}</td>
                       <td>{r.leadsTotal || "—"}</td>
                       <td>{r.buyers.size}</td>
@@ -1996,6 +2038,7 @@ function SalesReconcile() {
                         <td>{by === "phone" ? "телефону"
                           : by === "name" ? <span style={{ color: "#f59e0b" }}>ФИО</span>
                           : by === "ads" ? <span style={{ color: "var(--good)" }}>кабинету</span>
+                          : by === "late" ? <span className="muted" title="Клиент обращался, но уже после подписания договора">лид после сделки</span>
                           : <span className="muted">—</span>}</td>
                       </tr>
                     );
@@ -2007,7 +2050,9 @@ function SalesReconcile() {
             <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
               Сопоставление идёт тремя ключами по очереди: <b>телефон</b> в отчёте по лидам → <b>ФИО</b> в отчёте по лидам
               (если телефон не заполнен или записан иначе) → <b>выгрузка кабинета</b> (телефон или имя), если лида нет в CRM вовсе.
-              Совпадения по ФИО помечены жёлтым — они менее надёжны (однофамильцы), их стоит выборочно проверять.
+              Учитываются только обращения <b>до даты договора</b> — если клиент оставил заявку уже после покупки
+              (например, задал вопрос через рекламную форму), реклама его не приводила, такие помечены «лид после сделки»
+              и не приписываются ни одному источнику. Совпадения по ФИО помечены жёлтым — они менее надёжны (однофамильцы).
               «Не найден» — обращение было раньше периода выгрузки лидов, клиент пришёл напрямую/по рекомендации,
               либо данные в системах расходятся.
             </div>

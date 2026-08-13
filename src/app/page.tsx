@@ -1705,6 +1705,28 @@ function SalesReconcile() {
   };
   useEffect(refreshDbRanges, []);
 
+  // Отвечает JSON только если запрос дошёл целиком и сервер обработал его. Если тело
+  // превысило лимит платформы (Vercel режет запрос на 4.5 МБ), в ответ прилетает голый
+  // текст вроде "Request Entity Too Large" — res.json() падает с невнятной ошибкой парсинга.
+  // Разбираем это сами и даём понятное сообщение.
+  async function parseJsonSafe(res: Response): Promise<Record<string, unknown>> {
+    const text = await res.text();
+    let j: Record<string, unknown>;
+    try { j = JSON.parse(text); } catch {
+      throw new Error(res.status === 413 || /entity too large/i.test(text)
+        ? "Слишком много строк в одном запросе (лимит сервера ~4.5 МБ на запрос) — уменьшите размер порции"
+        : `Сервер ответил не-JSON (${res.status}): ${text.slice(0, 150)}`);
+    }
+    if (!res.ok) throw new Error(String(j.error ?? res.statusText));
+    return j;
+  }
+  async function postJson(url: string, body: unknown): Promise<Record<string, unknown>> {
+    return parseJsonSafe(await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
+  }
+  async function getJson(url: string): Promise<Record<string, unknown>> {
+    return parseJsonSafe(await fetch(url));
+  }
+
   const saveToDb = async () => {
     if (!leads || !allContracts) return;
     setSaving(true); setSaveMsg(null);
@@ -1712,15 +1734,19 @@ function SalesReconcile() {
       const jobs: [string, unknown[]][] = [["lead", leads], ["contract", allContracts]];
       if (adLeads) jobs.push(["adlead", adLeads]);
       const results: string[] = [];
+      // Шлём порциями по 2000 строк — иначе тело запроса на десятки тысяч лидов
+      // упирается в лимит размера запроса на Vercel (413 Request Entity Too Large).
+      const CHUNK = 2000;
       for (const [kind, rows] of jobs) {
-        const res = await fetch("/api/sales-recon", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ kind, rows }),
-        });
-        const j = await res.json();
-        if (!res.ok) throw new Error(j.error || res.statusText);
+        let inserted = 0, skipped = 0;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+          const j = await postJson("/api/sales-recon", { kind, rows: rows.slice(i, i + CHUNK) });
+          inserted += Number(j.inserted ?? 0);
+          skipped += Number(j.skippedDuplicates ?? 0);
+        }
         const label = kind === "lead" ? "лидов" : kind === "contract" ? "договоров" : "рекламных лидов";
-        results.push(`${label}: +${j.inserted} новых, ${j.skippedDuplicates} уже было`);
+        results.push(`${label}: +${inserted} новых, ${skipped} уже было`);
+        setSaveMsg(results.join(" · ") + " …"); // промежуточный статус, чтобы не выглядело зависшим
       }
       setSaveMsg(results.join(" · "));
       refreshDbRanges();
@@ -1736,13 +1762,13 @@ function SalesReconcile() {
       const qs = new URLSearchParams();
       if (dbSince) qs.set("since", dbSince);
       if (dbUntil) qs.set("until", dbUntil);
-      const res = await fetch("/api/sales-recon?" + qs.toString());
-      const j = await res.json();
-      if (!res.ok) throw new Error(j.error || res.statusText);
-      if (!j.lead?.length || !j.contract?.length) throw new Error("За этот период в базе нет данных — сначала сохраните выгрузки кнопкой «Сохранить в базу», либо расширьте период");
-      setLeads(j.lead);
-      setAllContracts(j.contract);
-      setAdLeads(j.adlead?.length ? j.adlead : null);
+      const j = await getJson("/api/sales-recon?" + qs.toString());
+      if (!j.lead || !(j.lead as unknown[]).length || !j.contract || !(j.contract as unknown[]).length)
+        throw new Error("За этот период в базе нет данных — сначала сохраните выгрузки кнопкой «Сохранить в базу», либо расширьте период");
+      setLeads(j.lead as LeadRow[]);
+      setAllContracts(j.contract as ContractRow[]);
+      const adl = j.adlead as unknown[] | undefined;
+      setAdLeads(adl?.length ? (adl as AdLeadRow[]) : null);
     } catch (e) {
       setErr((e as Error).message);
     }

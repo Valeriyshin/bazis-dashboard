@@ -1585,9 +1585,10 @@ async function readSheet(file: File): Promise<SheetRow[]> {
 interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string }
 interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string }
 interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: number }
-interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string }
+interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string; client: string }
 
 const NOT_FOUND = "Лид не найден (сайт/офлайн/вне периода выгрузки)";
+const AD_SOURCE = "Реклама (по выгрузке кабинета)";
 const NO_CAMPAIGN = "Кампания не указана в карточке лида";
 const GROUP_BY = [
   { key: "campaign", label: "Кампания (из карточки лида)", hint: "реальное название кампании/UTM из поля «Описание» — не зависит от ручного тегирования" },
@@ -1717,6 +1718,7 @@ function SalesReconcile() {
           adset: findCol(aHeaders, "adset_name", "название группы", "группа объявлений"),
           ad: findCol(aHeaders, "ad_name", "название объявления"),
           date: findCol(aHeaders, "created_time", "дата создания", "дата"),
+          client: findCol(aHeaders, "имя", "full_name", "name"),
         };
         parsedAdLeads = [];
         for (let i = ah + 1; i < adLeadRows.length; i++) {
@@ -1727,15 +1729,17 @@ function SalesReconcile() {
             ...(aCol.phone2 >= 0 ? normPhones(r[aCol.phone2]) : []),
             ...(aCol.wa >= 0 ? normPhones(r[aCol.wa]) : []),
           ]);
-          for (const phone of phones) {
-            parsedAdLeads.push({
-              phone,
-              campaign: String(r[aCol.campaign] ?? "").trim() || "—",
-              adset: String(r[aCol.adset] ?? "").trim(),
-              ad: String(r[aCol.ad] ?? "").trim(),
-              date: String(r[aCol.date] ?? "").trim(),
-            });
-          }
+          const client = aCol.client >= 0 ? String(r[aCol.client] ?? "").trim() : "";
+          const rec = {
+            campaign: String(r[aCol.campaign] ?? "").trim() || "—",
+            adset: String(r[aCol.adset] ?? "").trim(),
+            ad: String(r[aCol.ad] ?? "").trim(),
+            date: String(r[aCol.date] ?? "").trim(),
+            client,
+          };
+          // Строка без телефона, но с именем тоже нужна: она может стать мостиком по ФИО.
+          if (!phones.size && nameKey(client)) parsedAdLeads.push({ phone: "", ...rec });
+          for (const phone of phones) parsedAdLeads.push({ phone, ...rec });
         }
         if (!parsedAdLeads.length) throw new Error("Не удалось прочитать ни одной строки из выгрузки Центра лидов — проверьте файл");
       }
@@ -1770,15 +1774,39 @@ function SalesReconcile() {
     if (!prev || sortableDate(l.date) < sortableDate(prev.date)) leadByName.set(k, l);
   }
 
-  const matched: { contract: ContractRow; lead: LeadRow | null; by: "phone" | "name" | null }[] = (contracts ?? []).map((c) => {
+  // Индексы выгрузки Центра лидов — по телефону и по имени. Кабинет используется
+  // и как отдельная разрезка ("Форма"), и как третий ключ сопоставления: если лид
+  // не завели в CRM (или завели вне периода выгрузки), договор всё равно можно
+  // атрибутировать на рекламу напрямую по данным кабинета.
+  const adLeadByPhone = new Map<string, AdLeadRow>();
+  const adLeadByName = new Map<string, AdLeadRow>();
+  for (const l of adLeads ?? []) {
+    if (l.phone && !adLeadByPhone.has(l.phone)) adLeadByPhone.set(l.phone, l);
+    const nk = nameKey(l.client);
+    if (nk && !adLeadByName.has(nk)) adLeadByName.set(nk, l);
+  }
+  const adTotalMatched = (contracts ?? []).filter((c) => c.phones.some((p) => adLeadByPhone.has(p))).length;
+
+  const matched: { contract: ContractRow; lead: LeadRow | null; by: "phone" | "name" | "ads" | null }[] = (contracts ?? []).map((c) => {
     const byPhone = c.phones.map((p) => leadByPhone.get(p)).find((l) => l);
     if (byPhone) return { contract: c, lead: byPhone, by: "phone" as const };
     const byName = leadByName.get(nameKey(c.client));
     if (byName) return { contract: c, lead: byName, by: "name" as const };
+    // Третий ключ — сама выгрузка кабинета. Синтезируем лид, чтобы такой договор
+    // попал в отчёт как рекламный, а не в "не найден".
+    const ad = c.phones.map((p) => adLeadByPhone.get(p)).find((l) => l) ?? adLeadByName.get(nameKey(c.client));
+    if (ad) {
+      return {
+        contract: c,
+        lead: { phone: ad.phone, channel: "Центр лидов", source: AD_SOURCE, object: "", date: ad.date, client: ad.client, descr: "" },
+        by: "ads" as const,
+      };
+    }
     return { contract: c, lead: null, by: null };
   });
   const matchedByPhone = matched.filter((m) => m.by === "phone").length;
   const matchedByName = matched.filter((m) => m.by === "name").length;
+  const matchedByAds = matched.filter((m) => m.by === "ads").length;
 
   // Кампания ищется по ВСЕМ касаниям клиента, а не только по первому: описание с
   // названием кампании может быть заполнено на любом из обращений. Берём самое раннее
@@ -1803,14 +1831,6 @@ function SalesReconcile() {
     const hit = campByName.get(nameKey(c.client));
     return hit ? shortCampaign(hit.camp) : "";
   };
-
-  // Лид Центра лидов по телефону — используется и как отдельная разрезка ("Форма"),
-  // и как уточнение внутри общей картины.
-  const adLeadByPhone = new Map<string, AdLeadRow>();
-  for (const l of adLeads ?? []) {
-    if (!adLeadByPhone.has(l.phone)) adLeadByPhone.set(l.phone, l);
-  }
-  const adTotalMatched = (contracts ?? []).filter((c) => c.phones.some((p) => adLeadByPhone.has(p))).length;
 
   // Разрезка задаётся одним ключом: "Кампания" — из поля «Описание» карточки лида
   // (реальное название кампании, не зависит от оператора), "Источник информации" —
@@ -1906,7 +1926,7 @@ function SalesReconcile() {
             <div className="kpi-grid">
               <div className="kpi"><div className="label">Лидов (уник. телефонов)</div><div className="value">{leadByPhone.size}</div><div className="delta neutral">строк в выгрузке: {leads.length.toLocaleString("ru-RU")}</div></div>
               <div className="kpi"><div className="label">Договоров</div><div className="value">{totalDeals}</div><div className="delta neutral">из них без телефона: {noPhone}</div></div>
-              <div className="kpi"><div className="label">Сопоставлено с лидом</div><div className="value">{totalMatched} ({totalDeals ? Math.round((totalMatched / totalDeals) * 100) : 0}%)</div><div className="delta neutral">по телефону: {matchedByPhone} · по ФИО: {matchedByName}</div></div>
+              <div className="kpi"><div className="label">Сопоставлено с лидом</div><div className="value">{totalMatched} ({totalDeals ? Math.round((totalMatched / totalDeals) * 100) : 0}%)</div><div className="delta neutral">телефон: {matchedByPhone} · ФИО: {matchedByName} · кабинет: {matchedByAds}</div></div>
               <div className="kpi"><div className="label">Сумма договоров (без расторгнутых)</div><div className="value">{money(totalSum)}</div></div>
             </div>
           </div>
@@ -1973,7 +1993,10 @@ function SalesReconcile() {
                         </td>
                         <td>{lead ? (lead.source || <span className="muted">не заполнен</span>) : <span className="muted">—</span>}</td>
                         <td>{lead?.date ?? "—"}</td>
-                        <td>{by === "phone" ? "телефону" : by === "name" ? <span style={{ color: "#f59e0b" }}>ФИО</span> : <span className="muted">—</span>}</td>
+                        <td>{by === "phone" ? "телефону"
+                          : by === "name" ? <span style={{ color: "#f59e0b" }}>ФИО</span>
+                          : by === "ads" ? <span style={{ color: "var(--good)" }}>кабинету</span>
+                          : <span className="muted">—</span>}</td>
                       </tr>
                     );
                   })}
@@ -1982,10 +2005,11 @@ function SalesReconcile() {
             </div>
             {rowsToShow.length > 500 && <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>Показаны первые 500 из {rowsToShow.length}.</div>}
             <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
-              Сопоставление идёт двумя ключами: сначала по телефону, затем — если телефон в карточке лида не заполнен или
-              записан иначе — по ФИО (совпадение фамилии+имени, порядок слов не важен). Совпадения по ФИО помечены жёлтым:
-              они менее надёжны, чем по телефону, поэтому их стоит выборочно проверять. «Не найден» — обращение было раньше
-              периода выгрузки лидов, клиент пришёл напрямую/по рекомендации, либо данные в двух системах расходятся.
+              Сопоставление идёт тремя ключами по очереди: <b>телефон</b> в отчёте по лидам → <b>ФИО</b> в отчёте по лидам
+              (если телефон не заполнен или записан иначе) → <b>выгрузка кабинета</b> (телефон или имя), если лида нет в CRM вовсе.
+              Совпадения по ФИО помечены жёлтым — они менее надёжны (однофамильцы), их стоит выборочно проверять.
+              «Не найден» — обращение было раньше периода выгрузки лидов, клиент пришёл напрямую/по рекомендации,
+              либо данные в системах расходятся.
             </div>
           </div>
         </>

@@ -2020,6 +2020,42 @@ function SalesReconcile() {
     deals: t.deals + r.deals, sum: t.sum + r.sum,
   }), { reach: 0, clicks: 0, leads: 0, qual: 0, buyers: 0, buyersQual: 0, deals: 0, sum: 0 });
 
+  // ---- Когортный анализ: сколько дней проходит от первого обращения до договора ----
+  // Когорта = месяц первого обращения (не месяц договора) — так видно, как быстро
+  // "созревают" лиды именно этого месяца, а не сколько разных когорт закрылось в этом месяце.
+  const CYCLE_BUCKETS = [
+    { key: "0", label: "В день обращения", test: (d: number) => d === 0 },
+    { key: "1-7", label: "1–7 дней", test: (d: number) => d >= 1 && d <= 7 },
+    { key: "8-14", label: "8–14 дней", test: (d: number) => d >= 8 && d <= 14 },
+    { key: "15-30", label: "15–30 дней", test: (d: number) => d >= 15 && d <= 30 },
+    { key: "31-60", label: "31–60 дней", test: (d: number) => d >= 31 && d <= 60 },
+    { key: "61-90", label: "61–90 дней", test: (d: number) => d >= 61 && d <= 90 },
+    { key: "91-180", label: "91–180 дней", test: (d: number) => d >= 91 && d <= 180 },
+    { key: "181+", label: "Более 180 дней", test: (d: number) => d >= 181 },
+  ] as const;
+  const toDate = (yyyymmdd: string) => new Date(+yyyymmdd.slice(0, 4), +yyyymmdd.slice(4, 6) - 1, +yyyymmdd.slice(6, 8));
+  interface CohortRow { month: string; total: number; days: number[]; buckets: Record<string, number> }
+  const cohorts: Record<string, CohortRow> = {};
+  const allCycleDays: number[] = [];
+  for (const { contract, lead } of matched) {
+    if (!lead || !lead.date || !contract.date) continue;
+    const leadSD = sortableDate(lead.date), conSD = sortableDate(contract.date);
+    if (leadSD === "99999999" || conSD === "99999999") continue;
+    const days = Math.round((+toDate(conSD) - +toDate(leadSD)) / 86400000);
+    if (days < 0) continue; // подстраховка — earliestBefore уже не должен такого допускать
+    allCycleDays.push(days);
+    const month = leadSD.slice(0, 4) + "-" + leadSD.slice(4, 6);
+    const row = (cohorts[month] ??= { month, total: 0, days: [], buckets: Object.fromEntries(CYCLE_BUCKETS.map((b) => [b.key, 0])) });
+    row.total += 1;
+    row.days.push(days);
+    const bucket = CYCLE_BUCKETS.find((b) => b.test(days));
+    if (bucket) row.buckets[bucket.key] += 1;
+  }
+  const cohortRows = Object.values(cohorts).sort((a, b) => a.month.localeCompare(b.month));
+  const median = (arr: number[]) => { const s = [...arr].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : 0; };
+  const overallMedian = median(allCycleDays);
+  const overallAvg = allCycleDays.length ? allCycleDays.reduce((a, b) => a + b, 0) / allCycleDays.length : 0;
+
   const money = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
   const totalDeals = matched.length;
   const totalSum = matched.reduce((s, { contract }) => s + (/растор/i.test(contract.status) ? 0 : contract.sum), 0);
@@ -2127,6 +2163,56 @@ function SalesReconcile() {
               только по ним считается конверсия квал→продажа. «Покупателей всего» больше, потому что часть клиентов
               обратилась до периода выгрузки лидов или пришла мимо CRM — делить продажи на квал-лиды напрямую нельзя,
               это два независимых счётчика (иначе получаются конверсии выше 100%).
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-title">Когортный анализ: цикл сделки</div>
+            <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+              Когорта — месяц <b>первого обращения</b> клиента (не месяц договора). Показывает, сколько лидов этой
+              когорты дошли до сделки и через сколько дней. Считается только по договорам, у которых нашлось
+              обращение до даты подписания (телефон/ФИО/кабинет) — те же {matched.filter((m) => m.lead).length}, что в KPI выше.
+            </div>
+            <div className="kpi-grid" style={{ marginBottom: 14 }}>
+              <div className="kpi"><div className="label">Медиана цикла сделки</div><div className="value">{overallMedian} дн.</div></div>
+              <div className="kpi"><div className="label">Среднее</div><div className="value">{overallAvg.toFixed(0)} дн.</div></div>
+              <div className="kpi"><div className="label">Договоров в расчёте</div><div className="value">{allCycleDays.length}</div></div>
+            </div>
+            <div className="table-scroll">
+              <table>
+                <thead><tr>
+                  <th>Когорта (месяц лида)</th><th>Лидов→договор</th><th>Медиана, дн.</th>
+                  {CYCLE_BUCKETS.map((b) => <th key={b.key}>{b.label}</th>)}
+                </tr></thead>
+                <tbody>
+                  {cohortRows.map((r) => (
+                    <tr key={r.month}>
+                      <td>{r.month}</td>
+                      <td>{r.total}</td>
+                      <td>{median(r.days)}</td>
+                      {CYCLE_BUCKETS.map((b) => (
+                        <td key={b.key}>
+                          {r.buckets[b.key] || "—"}
+                          {r.buckets[b.key] > 0 && <span className="muted" style={{ fontSize: 11 }}> ({((r.buckets[b.key] / r.total) * 100).toFixed(0)}%)</span>}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                  <tr style={{ fontWeight: 700, background: "var(--panel-2)" }}>
+                    <td>Итого</td>
+                    <td>{allCycleDays.length}</td>
+                    <td>{overallMedian}</td>
+                    {CYCLE_BUCKETS.map((b) => {
+                      const n = cohortRows.reduce((s, r) => s + r.buckets[b.key], 0);
+                      return <td key={b.key}>{n || "—"}{n > 0 && <span className="muted" style={{ fontSize: 11 }}> ({((n / allCycleDays.length) * 100).toFixed(0)}%)</span>}</td>;
+                    })}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+              Свежие когорты (последние 1–2 месяца выгрузки) занижены систематически: часть их лидов ещё не успела
+              дойти до сделки и появится в отчёте только в следующих выгрузках — не читайте это как «спад конверсии».
             </div>
           </div>
 

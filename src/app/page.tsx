@@ -1587,13 +1587,44 @@ async function readSheet(file: File): Promise<SheetRow[]> {
   return XLSX.utils.sheet_to_json<SheetRow>(ws, { header: 1, defval: "" }) as unknown as SheetRow[];
 }
 
-interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string }
+interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string; meeting: boolean }
 interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string }
 interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: number }
 interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string; client: string }
 
 const NOT_FOUND = "Лид не найден (сайт/офлайн/вне периода выгрузки)";
 const LATE_TOUCH = "Обращение только ПОСЛЕ сделки (реклама не привела)";
+
+// Кириллические двойники латиницы: в выгрузках встречается "CASCADЕ" с русской «Е»,
+// из-за чего название не совпадает с "Cascade" из рекламных кабинетов.
+const HOMOGLYPH: Record<string, string> = {
+  "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X",
+  "а": "a", "в": "b", "е": "e", "к": "k", "м": "m", "н": "h", "о": "o", "р": "p", "с": "c", "т": "t", "у": "y", "х": "x",
+};
+// Ключ ЖК, общий для трёх источников: рекламные кабинеты ("Satpaev"), поле «Объект»
+// в CRM ("VESPER, 1 очередь") и колонка «ЖК» в реестре ("Landmark Gold, V очередь").
+// Берём часть до запятой и отбрасываем номер очереди — это один и тот же проект.
+const ZHK_STAGE_CANON: Record<string, string> = {
+  landmark: "landmarkgold", monaco: "grandmonaco", riviera: "rivieraplus",
+  nurlydala2: "nurlydalaii", admplus: "adamantplus", admlife: "adamantlife",
+};
+function zhkKey(raw: string): string {
+  const s = String(raw ?? "").replace(/[АВЕКМНОРСТУХавекмнорстух]/g, (c) => HOMOGLYPH[c] ?? c)
+    .split(",")[0]
+    .replace(/\s*\b[IVX0-9]+\s*очеред\w*/gi, "")
+    .replace(/\bочеред\w*/gi, "")
+    .toLowerCase().replace(/[^a-z0-9а-я]+/g, "");
+  return ZHK_STAGE_CANON[s] ?? s;
+}
+// Строка воронки по ЖК: показы/клики из рекламных кабинетов, лиды и квал-лиды из CRM,
+// продажи из реестра договоров.
+interface FunnelRow {
+  zhk: string; reach: number; clicks: number;
+  leads: Set<string>; qual: Set<string>;
+  buyers: Set<string>;      // все покупатели этого ЖК
+  buyersQual: Set<string>;  // из них те, кто был квал-лидом — только по ним честная конверсия
+  deals: number; sum: number;
+}
 const AD_SOURCE = "Реклама (по выгрузке кабинета)";
 const NO_CAMPAIGN = "Кампания не указана в карточке лида";
 const GROUP_BY = [
@@ -1633,6 +1664,33 @@ function SalesReconcile() {
   const [adLeads, setAdLeads] = useState<AdLeadRow[] | null>(null);
   const [unmatchedOnly, setUnmatchedOnly] = useState(false);
   const [groupBy, setGroupBy] = useState<GroupKey>("source");
+  // Показы/охват/клики для воронки берём из уже синхронизированных рекламных кабинетов.
+  const [adsByZhk, setAdsByZhk] = useState<Record<string, { reach: number; clicks: number }> | null>(null);
+  const [adsPeriod, setAdsPeriod] = useState<string>("");
+  useEffect(() => {
+    const acc: Record<string, { reach: number; clicks: number }> = {};
+    const canon = new Map<string, string>();
+    const add = (name: string, reach: number, clicks: number) => {
+      const k = zhkKey(resolveZhk(name, canon));
+      if (!k) return;
+      const o = (acc[k] ??= { reach: 0, clicks: 0 });
+      o.reach += reach; o.clicks += clicks;
+    };
+    Promise.all([
+      fetch("/api/data").then((r) => r.json()).catch(() => null),
+      fetch("/api/google").then((r) => r.json()).catch(() => null),
+      fetch("/api/tiktok").then((r) => r.json()).catch(() => null),
+      fetch("/api/yandex").then((r) => r.json()).catch(() => null),
+    ]).then(([meta, google, tiktok, yandex]) => {
+      // Сначала Meta — у неё стабильный нейминг, она наполняет canon для остальных.
+      for (const c of meta?.campaigns ?? []) add(c.name, +c.reach || 0, +c.clicks || 0);
+      for (const c of google?.campaigns ?? []) add(c.name, 0, +c.clicks || 0);
+      for (const c of tiktok?.campaigns ?? []) add(c.name, 0, +c.clicks || 0);
+      for (const c of yandex?.campaigns ?? []) add(c.name, 0, +c.clicks || 0);
+      setAdsByZhk(acc);
+      if (meta?.snapshot) setAdsPeriod(`${meta.snapshot.period_start} — ${meta.snapshot.period_end}`);
+    });
+  }, []);
 
   const run = async () => {
     if (!leadsFile || !contractsFile) { setErr("Загрузите хотя бы «Отчёт по Лидам» и «Реестр договоров»"); return; }
@@ -1653,6 +1711,7 @@ function SalesReconcile() {
         date: findCol(lHeaders, "дата начала", "дата"),
         client: findCol(lHeaders, "клиент"),
         descr: findCol(lHeaders, "описание"),
+        meeting: findCol(lHeaders, "встреча"),
       };
       const parsedLeads: LeadRow[] = [];
       for (let i = lh + 1; i < leadRows.length; i++) {
@@ -1666,6 +1725,8 @@ function SalesReconcile() {
           date: String(r[lCol.date] ?? "").trim(),
           client,
           descr: String(r[lCol.descr] ?? "").trim(),
+          // «Встреча назначена» / «Встреча не назначена» — признак квалифицированного лида.
+          meeting: /встреча\s+назначена/i.test(String(r[lCol.meeting] ?? "")),
         };
         const phones = normPhones(r[lCol.phone]);
         // Лид без телефона, но с ФИО тоже сохраняем: карточку могли заполнить плохо,
@@ -1832,7 +1893,7 @@ function SalesReconcile() {
     if (ad && (!c.date || !ad.date || sortableAdDate(ad.date) <= sortableDate(c.date))) {
       return {
         contract: c,
-        lead: { phone: ad.phone, channel: "Центр лидов", source: AD_SOURCE, object: "", date: ad.date, client: ad.client, descr: "" },
+        lead: { phone: ad.phone, channel: "Центр лидов", source: AD_SOURCE, object: "", date: ad.date, client: ad.client, descr: "", meeting: false },
         by: "ads" as const,
       };
     }
@@ -1920,6 +1981,45 @@ function SalesReconcile() {
   const reconRows = Object.values(recon).sort((a, b) =>
     isTail(a.channel) - isTail(b.channel) || b.sum - a.sum);
 
+  // ---- Воронка по ЖК: Охват → Клики → Лиды → Квал-лиды → Продажи ----
+  // Три источника с разными написаниями ЖК сводятся общим ключом zhkKey().
+  const funnel: Record<string, FunnelRow> = {};
+  const fRow = (key: string, label: string) =>
+    (funnel[key] ??= { zhk: label, reach: 0, clicks: 0, leads: new Set(), qual: new Set(), buyers: new Set(), buyersQual: new Set(), deals: 0, sum: 0 });
+  for (const [k, v] of Object.entries(adsByZhk ?? {})) {
+    const r = fRow(k, k);
+    r.reach += v.reach; r.clicks += v.clicks;
+  }
+  // Лиды считаем по уникальным клиентам (телефон, иначе ФИО): одна карточка = много строк.
+  const qualIds = new Set<string>();
+  for (const l of leads ?? []) {
+    const k = zhkKey(l.object);
+    if (!k) continue;
+    const id = l.phone || nameKey(l.client);
+    if (!id) continue;
+    const r = fRow(k, l.object.split(",")[0].trim() || k);
+    r.leads.add(id);
+    if (l.meeting) { r.qual.add(id); qualIds.add(id); }
+  }
+  for (const { contract } of matched) {
+    const k = zhkKey(contract.zhk);
+    if (!k) continue;
+    const r = fRow(k, contract.zhk.split(",")[0].trim() || k);
+    r.deals += 1;
+    const id = contract.phones[0] || nameKey(contract.client);
+    r.buyers.add(id || String(r.deals));
+    // Честная конверсия квал→продажа возможна только по тем покупателям, которых мы
+    // реально видели как квал-лид: иначе делим два независимых счётчика и получаем >100%.
+    if (id && qualIds.has(id)) r.buyersQual.add(id);
+    if (!/растор/i.test(contract.status)) r.sum += contract.sum;
+  }
+  const funnelRows = Object.values(funnel).sort((a, b) => b.sum - a.sum || b.leads.size - a.leads.size);
+  const fTotal = funnelRows.reduce((t, r) => ({
+    reach: t.reach + r.reach, clicks: t.clicks + r.clicks, leads: t.leads + r.leads.size,
+    qual: t.qual + r.qual.size, buyers: t.buyers + r.buyers.size, buyersQual: t.buyersQual + r.buyersQual.size,
+    deals: t.deals + r.deals, sum: t.sum + r.sum,
+  }), { reach: 0, clicks: 0, leads: 0, qual: 0, buyers: 0, buyersQual: 0, deals: 0, sum: 0 });
+
   const money = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
   const totalDeals = matched.length;
   const totalSum = matched.reduce((s, { contract }) => s + (/растор/i.test(contract.status) ? 0 : contract.sum), 0);
@@ -1970,6 +2070,63 @@ function SalesReconcile() {
               <div className="kpi"><div className="label">Сопоставлено с лидом</div><div className="value">{totalMatched} ({totalDeals ? Math.round((totalMatched / totalDeals) * 100) : 0}%)</div><div className="delta neutral">телефон: {matchedByPhone} · ФИО: {matchedByName} · кабинет: {matchedByAds}</div></div>
               <div className="kpi"><div className="label">Обращение после сделки</div><div className="value">{matchedLate}</div><div className="delta neutral">не считаем источником привлечения</div></div>
               <div className="kpi"><div className="label">Сумма договоров (без расторгнутых)</div><div className="value">{money(totalSum)}</div></div>
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-title">Воронка по ЖК</div>
+            <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+              Охват и клики — из рекламных кабинетов{adsPeriod && <> (период базы: <b>{adsPeriod}</b>)</>}; лиды и квал-лиды — из
+              «Отчёта по Лидам» (поле «Объект»); продажи — из реестра договоров (колонка «ЖК»).
+              Названия ЖК в трёх системах пишутся по-разному («VESPER, 1 очередь», «Landmark Gold, V очередь», «CASCADЕ»
+              с кириллической Е) — сводятся к одному проекту автоматически.
+              {!adsByZhk && <> · <span className="err">загружаю данные кабинетов…</span></>}
+              <br /><b>Периоды могут не совпадать:</b> охват и клики берутся за период последнего синка базы, а лиды и
+              продажи — за период загруженных файлов. Для корректного сравнения обновите базу тем же периодом.
+            </div>
+            <div className="table-scroll">
+              <table>
+                <thead><tr>
+                  <th>ЖК</th><th>Охват</th><th>Клики</th><th>Лиды</th><th>Квал-лиды<br />(встреча назначена)</th>
+                  <th>CR лид→квал</th><th title="Покупатели, которых мы видели в лидах как квал">Купили из квал-лидов</th>
+                  <th>CR квал→продажа</th><th>Покупателей<br />всего</th><th>Договоров</th><th>Сумма</th>
+                </tr></thead>
+                <tbody>
+                  {funnelRows.map((r) => (
+                    <tr key={r.zhk}>
+                      <td>{r.zhk}</td>
+                      <td>{r.reach ? int0(r.reach) : "—"}</td>
+                      <td>{r.clicks ? int0(r.clicks) : "—"}</td>
+                      <td>{r.leads.size || "—"}</td>
+                      <td>{r.qual.size || "—"}</td>
+                      <td>{r.leads.size ? ((r.qual.size / r.leads.size) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
+                      <td>{r.buyersQual.size || "—"}</td>
+                      <td>{r.qual.size ? ((r.buyersQual.size / r.qual.size) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
+                      <td>{r.buyers.size || "—"}</td>
+                      <td>{r.deals || "—"}</td>
+                      <td>{r.sum ? money(r.sum) : "—"}</td>
+                    </tr>
+                  ))}
+                  <tr style={{ fontWeight: 700, background: "var(--panel-2)" }}>
+                    <td>Итого</td>
+                    <td>{int0(fTotal.reach)}</td><td>{int0(fTotal.clicks)}</td>
+                    <td>{fTotal.leads}</td><td>{fTotal.qual}</td>
+                    <td>{fTotal.leads ? ((fTotal.qual / fTotal.leads) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
+                    <td>{fTotal.buyersQual}</td>
+                    <td>{fTotal.qual ? ((fTotal.buyersQual / fTotal.qual) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%" : "—"}</td>
+                    <td>{fTotal.buyers}</td><td>{fTotal.deals}</td>
+                    <td>{money(fTotal.sum)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+              Лиды и квал-лиды считаются по уникальным клиентам (телефон, иначе ФИО) — в выгрузке одна карточка занимает
+              много строк. Охват отдаёт только Meta, поэтому по остальным площадкам в этой колонке пусто.
+              <br />«Купили из квал-лидов» — покупатели, которых мы реально видели в лидах со статусом «встреча назначена»;
+              только по ним считается конверсия квал→продажа. «Покупателей всего» больше, потому что часть клиентов
+              обратилась до периода выгрузки лидов или пришла мимо CRM — делить продажи на квал-лиды напрямую нельзя,
+              это два независимых счётчика (иначе получаются конверсии выше 100%).
             </div>
           </div>
 

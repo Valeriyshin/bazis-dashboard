@@ -101,19 +101,15 @@ export function inferSource(descr: string): string | null {
   if (campaignFromDescr(descr)) return "Instagram";
   return null;
 }
-// Ручное поле "Источник информации" ненадёжно именно в этих двух случаях: не
-// заполнено вовсе, либо заполнено обобщённо ("Реклама в интернете" — не говорит,
-// какая именно реклама). Остальные значения (уже конкретные — "TikTok",
-// "Рекомендация от знакомых" и т.д.) не переопределяем.
-function isUnreliableSource(manual: string): boolean {
-  return !manual || /реклама в интернете/i.test(manual);
-}
+// Описание карточки — это фактические данные с рекламной платформы (кампания/UTM),
+// а ручное поле "Источник информации" заполняется оператором и может быть неверным
+// в любой карточке, не только в "Реклама в интернете"/пустых — поэтому сигнал из
+// "Описания" проверяем и используем везде, если он там есть, а не только для
+// заведомо сомнительных значений.
 export function sourceOf(l: LeadRow): string {
   const manual = (l.source || "").trim();
-  if (isUnreliableSource(manual)) {
-    const inferred = inferSource(l.descr);
-    if (inferred) return inferred;
-  }
+  const inferred = inferSource(l.descr);
+  if (inferred) return inferred;
   return manual || "(не заполнено)";
 }
 

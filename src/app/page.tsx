@@ -1671,6 +1671,82 @@ function shortCampaign(full: string): string {
   return full.split("|").slice(0, 3).map((s) => s.trim()).filter(Boolean).join(" | ");
 }
 
+/* ============ Передача квал-лидов ("встреча назначена") в Meta как офлайн-конверсии ============ */
+// Матчинг идёт по leadgen_id (из "Описания" карточки, "...; l:123..."), а не по хэшу
+// телефона — почти 100% точность, в отличие от 30-60% при матчинге по контактным
+// данным. Два шага: "Синк" находит новые квал-лиды с lead_id и складывает в очередь
+// в базе; "Отправить" шлёт накопленную очередь в Meta (или, если ещё не заданы
+// META_OFFLINE_DATASET_ID/токен в Vercel, показывает, что было бы отправлено, без
+// реального вызова — чтобы можно было собирать очередь параллельно с настройкой
+// на стороне Meta).
+function MetaOfflinePanel() {
+  const [status, setStatus] = useState<{ byStatus: { status: string; n: number }[]; configured: boolean } | null>(null);
+  const [busy, setBusy] = useState<"sync" | "send" | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const refresh = () => {
+    fetch("/api/meta-offline").then((r) => r.json()).then(setStatus).catch(() => {});
+  };
+  useEffect(refresh, []);
+
+  const run = async (action: "sync" | "send") => {
+    setBusy(action); setMsg(null);
+    try {
+      const res = await fetch("/api/meta-offline", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }),
+      });
+      const j = await res.json();
+      if (j.error) throw new Error(j.error);
+      if (action === "sync") {
+        setMsg(`Найдено квал-лидов с lead_id: ${j.found} · новых в очереди: ${j.inserted} · без даты (пропущено): ${j.skippedNoDate}`);
+      } else {
+        setMsg(j.dryRun
+          ? `Пробный режим (не настроены переменные окружения): в очереди к отправке ${j.queued}. ${j.message}`
+          : j.errors > 0
+            ? `Ошибка отправки (${j.metaStatus}): ${j.metaResponse}`
+            : `Отправлено в Meta: ${j.sent}`);
+      }
+      refresh();
+    } catch (e) {
+      setMsg("Ошибка: " + (e as Error).message);
+    }
+    setBusy(null);
+  };
+
+  const counts = Object.fromEntries((status?.byStatus ?? []).map((r) => [r.status, r.n]));
+  return (
+    <div className="panel">
+      <div className="panel-title">Квал-лиды → офлайн-конверсии в Meta</div>
+      <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+        Каждая заявка через нативную лид-форму Meta несёт свой <code>leadgen_id</code> (передаётся в конце поля «Описание»,
+        «...; l:123...»). Когда по такому лиду ставится «Встреча назначена», это событие можно отправить в Meta как
+        офлайн-конверсию — тогда кампанию можно оптимизировать не на факт заявки, а на реальную квалификацию.
+        <br />1) «Синк» — находит в базе новые квал-лиды с <code>lead_id</code> и складывает в очередь на отправку.
+        2) «Отправить в Meta» — шлёт накопленную очередь (батчами до 1000).
+        {status && !status.configured && (
+          <> <b>Сейчас не заданы</b> переменные окружения <code>META_OFFLINE_DATASET_ID</code> и
+          <code> META_OFFLINE_TOKEN</code> (Vercel → Settings → Environment Variables) — отправка будет работать
+          в пробном режиме (без реального вызова Meta), пока их не добавите.</>
+        )}
+      </div>
+      <div className="kpi-grid" style={{ marginBottom: 12 }}>
+        <div className="kpi"><div className="label">В очереди</div><div className="value">{counts.pending ?? 0}</div></div>
+        <div className="kpi"><div className="label">Отправлено</div><div className="value">{counts.sent ?? 0}</div></div>
+        <div className="kpi"><div className="label">Ошибок отправки</div><div className="value">{counts.error ?? 0}</div></div>
+      </div>
+      <div className="controls">
+        <button className="btn" onClick={() => run("sync")} disabled={busy !== null}>
+          {busy === "sync" ? "⏳ Ищу…" : "Синк: найти новые квал-лиды"}
+        </button>
+        <button className="btn" onClick={() => run("send")} disabled={busy !== null}>
+          {busy === "send" ? "⏳ Отправляю…" : "Отправить в Meta"}
+        </button>
+      </div>
+      {msg && <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>{msg}</div>}
+    </div>
+  );
+}
+
 function SalesReconcile() {
   // Несколько файлов на поле — так можно разбить огромную выгрузку (например, "лиды
   // с 2024 года") на части по году/периоду и не упереться в лимит памяти браузера
@@ -2392,6 +2468,8 @@ function SalesReconcile() {
           </div>
         )}
       </div>
+
+      <MetaOfflinePanel />
 
       {leads && contracts && (
         <>

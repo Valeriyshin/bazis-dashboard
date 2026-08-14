@@ -106,6 +106,15 @@ export function inferSource(descr: string): string | null {
 // в любой карточке, не только в "Реклама в интернете"/пустых — поэтому сигнал из
 // "Описания" проверяем и используем везде, если он там есть, а не только для
 // заведомо сомнительных значений.
+// leadgen_id из нативной лид-формы Meta прокидывается в конец "Описания" в формате
+// "...; l:38037037699213775". По нему офлайн-события матчатся к исходному клику
+// почти со 100% точностью — в отличие от хэша телефона (30–60%).
+const LEAD_ID_RE = /\bl:(\d{6,})/;
+export function leadIdOf(descr: string): string | null {
+  const m = String(descr ?? "").match(LEAD_ID_RE);
+  return m ? m[1] : null;
+}
+
 export function sourceOf(l: LeadRow): string {
   const manual = (l.source || "").trim();
   const inferred = inferSource(l.descr);

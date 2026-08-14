@@ -6,7 +6,7 @@
 
 export interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string; meeting: boolean }
 export interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string; propType: string; number: string }
-export interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: number; buyers: number }
+export interface ReconRow { channel: string; leadsTotal: number; qual: number; deals: number; sum: number; buyers: number }
 export interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string; client: string }
 
 export const NOT_FOUND = "Лид не найден (сайт/офлайн/вне периода выгрузки)";
@@ -75,6 +75,46 @@ export function campaignFromDescr(descr: string): string {
 }
 export function shortCampaign(full: string): string {
   return full.split("|").slice(0, 3).map((s) => s.trim()).filter(Boolean).join(" | ");
+}
+
+// «Источник информации» — поле, которое оператор заполняет вручную, и оно часто
+// либо пустое, либо содержит расплывчатое "Реклама в интернете". Но в поле
+// «Описание» той же карточки нередко есть либо цепочка кампании из Ads Manager
+// (Meta) без UTM-меток, либо форма сайта с явной UTM-меткой utm_source — оттуда
+// можно восстановить настоящий источник, не полагаясь на ручное заполнение.
+const UTM_SOURCE_RE = /utm\s*source\s*:?\s*([a-zа-я0-9_.\-]+)/i;
+export function inferSource(descr: string): string | null {
+  if (!descr) return null;
+  const utm = descr.match(UTM_SOURCE_RE);
+  if (utm) {
+    const v = utm[1].trim().toLowerCase();
+    if (/^(site|сайт|website)/.test(v)) return "Сайт жилого комплекса";
+    if (/instagram|^ig$/.test(v)) return "Instagram";
+    if (/facebook|^fb$/.test(v)) return "Instagram"; // тот же кабинет Meta, что и Instagram
+    if (/google/.test(v)) return "Поисковая рекл. Google/Яндекс";
+    if (/yandex|яндекс/.test(v)) return "Поисковая рекл. Google/Яндекс";
+    if (/tiktok/.test(v)) return "TikTok";
+    return v.charAt(0).toUpperCase() + v.slice(1) + " (UTM)";
+  }
+  // Цепочка вида "3000SAT | Лиды | Satpaev | ..." без UTM-меток — формат
+  // Ads Manager для лид-форм, которые публикуются в Instagram/Facebook.
+  if (campaignFromDescr(descr)) return "Instagram";
+  return null;
+}
+// Ручное поле "Источник информации" ненадёжно именно в этих двух случаях: не
+// заполнено вовсе, либо заполнено обобщённо ("Реклама в интернете" — не говорит,
+// какая именно реклама). Остальные значения (уже конкретные — "TikTok",
+// "Рекомендация от знакомых" и т.д.) не переопределяем.
+function isUnreliableSource(manual: string): boolean {
+  return !manual || /реклама в интернете/i.test(manual);
+}
+export function sourceOf(l: LeadRow): string {
+  const manual = (l.source || "").trim();
+  if (isUnreliableSource(manual)) {
+    const inferred = inferSource(l.descr);
+    if (inferred) return inferred;
+  }
+  return manual || "(не заполнено)";
 }
 
 /* ---------- разбор названий кампаний рекламных кабинетов → ЖК (для воронки) ---------- */
@@ -298,23 +338,34 @@ export function buildReconciliation(
 
   const groupOf = (l: LeadRow, phone: string, c: ContractRow): string => {
     if (groupBy === "campaign") return campaignOf(c) || NO_CAMPAIGN;
-    if (groupBy === "source") return l.source || "(не заполнено)";
+    if (groupBy === "source") return sourceOf(l);
     if (groupBy === "channel") return l.channel || "(не заполнено)";
     return adLeadByPhone.get(phone)?.campaign ?? "(нет в Центре лидов)";
   };
+  // Квал-лид — телефон, у которого хоть на одном обращении стоит "встреча назначена"
+  // (не обязательно на первом/учтённом в leadByPhone касании).
+  const qualByPhone = new Set<string>();
+  for (const l of leads) if (l.meeting && l.phone) qualByPhone.add(l.phone);
+
   const leadsPerGroup: Record<string, number> = {};
+  const qualPerGroup: Record<string, number> = {};
   if (groupBy === "form") {
-    for (const l of adLeadByPhone.values()) leadsPerGroup[l.campaign] = (leadsPerGroup[l.campaign] ?? 0) + 1;
+    for (const l of adLeadByPhone.values()) {
+      leadsPerGroup[l.campaign] = (leadsPerGroup[l.campaign] ?? 0) + 1;
+      if (qualByPhone.has(l.phone)) qualPerGroup[l.campaign] = (qualPerGroup[l.campaign] ?? 0) + 1;
+    }
   } else if (groupBy === "campaign") {
     for (const phone of leadByPhone.keys()) {
       const hit = campByPhone.get(phone);
       const k = hit ? shortCampaign(hit.camp) : NO_CAMPAIGN;
       leadsPerGroup[k] = (leadsPerGroup[k] ?? 0) + 1;
+      if (qualByPhone.has(phone)) qualPerGroup[k] = (qualPerGroup[k] ?? 0) + 1;
     }
   } else {
     for (const [phone, l] of leadByPhone) {
-      const k = groupBy === "source" ? (l.source || "(не заполнено)") : (l.channel || "(не заполнено)");
+      const k = groupBy === "source" ? sourceOf(l) : (l.channel || "(не заполнено)");
       leadsPerGroup[k] = (leadsPerGroup[k] ?? 0) + 1;
+      if (qualByPhone.has(phone)) qualPerGroup[k] = (qualPerGroup[k] ?? 0) + 1;
     }
   }
 
@@ -324,17 +375,17 @@ export function buildReconciliation(
     const key = lead
       ? groupOf(lead, contract.phones.find((p) => leadByPhone.has(p)) ?? contract.phones[0] ?? "", contract)
       : by === "late" ? LATE_TOUCH : NOT_FOUND;
-    const row = (recon[key] ??= { channel: key, leadsTotal: leadsPerGroup[key] ?? 0, deals: 0, sum: 0, buyers: 0, _buyers: new Set() });
+    const row = (recon[key] ??= { channel: key, leadsTotal: leadsPerGroup[key] ?? 0, qual: qualPerGroup[key] ?? 0, deals: 0, sum: 0, buyers: 0, _buyers: new Set() });
     row.deals += 1;
     row._buyers.add(contract.phones[0] || nameKey(contract.client));
     if (!/растор/i.test(contract.status)) row.sum += contract.sum;
   }
   for (const [g, cnt] of Object.entries(leadsPerGroup)) {
-    if (!recon[g]) recon[g] = { channel: g, leadsTotal: cnt, deals: 0, sum: 0, buyers: 0, _buyers: new Set() };
+    if (!recon[g]) recon[g] = { channel: g, leadsTotal: cnt, qual: qualPerGroup[g] ?? 0, deals: 0, sum: 0, buyers: 0, _buyers: new Set() };
   }
   const isTail = (k: string) => (k === NOT_FOUND || k === LATE_TOUCH ? 1 : 0);
   const reconRows: ReconRow[] = Object.values(recon)
-    .map((r) => ({ channel: r.channel, leadsTotal: r.leadsTotal, deals: r.deals, sum: r.sum, buyers: r._buyers.size }))
+    .map((r) => ({ channel: r.channel, leadsTotal: r.leadsTotal, qual: r.qual, deals: r.deals, sum: r.sum, buyers: r._buyers.size }))
     .sort((a, b) => isTail(a.channel) - isTail(b.channel) || b.sum - a.sum);
 
   // ---- Воронка по ЖК ----

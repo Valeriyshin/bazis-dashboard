@@ -1763,14 +1763,13 @@ function SalesReconcile() {
   // ограничение в 80 000 строк на "сырой" эндпоинт здесь не действует — можно сверять
   // весь накопленный период разом.
   const [dbAgg, setDbAgg] = useState<ReconciliationResult | null>(null);
-  const [dbGroupBy, setDbGroupBy] = useState<GroupKey>("source");
   const loadAggFromDb = async () => {
     setLoadingDb(true); setErr(null); setDbAgg(null);
     try {
       const qs = new URLSearchParams();
       if (dbSince) qs.set("since", dbSince);
       if (dbUntil) qs.set("until", dbUntil);
-      qs.set("groupBy", dbGroupBy);
+      qs.set("groupBy", "source");
       qs.set("apartmentsOnly", apartmentsOnly ? "1" : "0");
       const j = await getJson("/api/sales-recon/aggregate?" + qs.toString());
       setDbAgg(j as unknown as ReconciliationResult);
@@ -2330,27 +2329,25 @@ function SalesReconcile() {
 
             <div style={{ marginTop: 16 }}>
               <div className="panel-title">Продажи по источникам</div>
-              <div className="chips" style={{ marginBottom: 4 }}>
-                {GROUP_BY.map((g) => (
-                  <div key={g.key} className={"chip" + (dbGroupBy === g.key ? " on" : "")}
-                    onClick={() => setDbGroupBy(g.key)} title={g.hint}>{g.label}</div>
-                ))}
-              </div>
               <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
-                {GROUP_BY.find((g) => g.key === dbGroupBy)?.hint} · после смены разрезки нажмите «Сверить за период из базы» ещё раз.
+                Источник информации — заполняется вручную оператором, но там, где записано «Реклама в интернете» или
+                поле пустое, источник восстанавливается из поля «Описание» карточки: цепочка кампании без UTM-меток
+                (формат Ads Manager) → Instagram, UTM-метка сайта → «Сайт жилого комплекса», другие UTM-источники —
+                по значению метки. Остальные (уже конкретно заполненные вручную) значения не переопределяются.
               </div>
               <div className="table-scroll">
                 <table>
-                  <thead><tr><th>{GROUP_BY.find((g) => g.key === dbGroupBy)?.label}</th><th>Лидов (уник.)</th><th>Покупателей</th><th>Договоров</th><th>Конверсия лид→покупатель</th><th>Сумма договоров</th></tr></thead>
+                  <thead><tr><th>Источник информации</th><th>Лидов (уник.)</th><th>Квал-лид</th><th>Конверсия в квал</th><th>Покупателей</th><th>Договоров</th><th>Конверсия лид→покупатель</th></tr></thead>
                   <tbody>
                     {dbAgg.reconRows.map((r) => (
                       <tr key={r.channel} style={(r.channel === NOT_FOUND || r.channel === LATE_TOUCH) ? { color: "var(--muted)" } : undefined}>
                         <td>{r.channel}</td>
                         <td>{r.leadsTotal || "—"}</td>
+                        <td>{r.qual || "—"}</td>
+                        <td>{r.leadsTotal ? ((r.qual / r.leadsTotal) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" : "—"}</td>
                         <td>{r.buyers}</td>
                         <td>{r.deals}</td>
                         <td>{r.leadsTotal ? ((r.buyers / r.leadsTotal) * 100).toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + "%" : "—"}</td>
-                        <td>{money(r.sum)}</td>
                       </tr>
                     ))}
                   </tbody>

@@ -2685,7 +2685,18 @@ function RefreshBar({ snapshot }: { snapshot: ApiData["snapshot"] }) {
   const [since, setSince] = useState(snapshot.period_start);
   const [until, setUntil] = useState(snapshot.period_end);
   const [loading, setLoading] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
+  // Предупреждение о недоступной площадке переживает полную перезагрузку страницы
+  // (через sessionStorage) — сам refresh() всегда доводит обновление до конца и
+  // перезагружает страницу, даже если какая-то площадка не ответила: иначе один
+  // упавший TikTok/Яндекс блокировал обновление вообще всей сводки.
+  const [msg, setMsg] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      const w = sessionStorage.getItem("refreshWarning");
+      if (w) { sessionStorage.removeItem("refreshWarning"); return w; }
+    } catch { /* sessionStorage недоступен — не критично */ }
+    return null;
+  });
 
   const refresh = async () => {
     setLoading(true); setMsg(null);
@@ -2697,18 +2708,17 @@ function RefreshBar({ snapshot }: { snapshot: ApiData["snapshot"] }) {
       });
       const j = await res.json();
       if (!res.ok) { setMsg("Ошибка: " + (j.error || res.status)); setLoading(false); return; }
-      // Остальные площадки синхронизируются best-effort — если какая-то упала, показываем,
-      // а не молчим (иначе в сводке останутся данные за старый период с этой площадки).
+      // Остальные площадки синхронизируются best-effort — если какая-то упала, не блокируем
+      // обновление остальных: перезагружаем страницу в любом случае, а про недоступную
+      // площадку просто предупреждаем (иначе в сводке остаются данные за старый период
+      // сразу по всем площадкам, хотя Meta/Google/Яндекс уже обновились).
       const failed: string[] = [];
       if (j.googleError) failed.push("Google Ads: " + String(j.googleError).slice(0, 120));
       if (j.yandexError) failed.push("Яндекс: " + String(j.yandexError).slice(0, 120));
       if (j.tiktokError) failed.push("TikTok: " + String(j.tiktokError).slice(0, 120));
       if (failed.length) {
-        setMsg("Meta обновлена, но не удалось: " + failed.join(" · "));
-        setLoading(false);
-        return;
+        try { sessionStorage.setItem("refreshWarning", "Обновлено, но не удалось: " + failed.join(" · ")); } catch { /* не критично */ }
       }
-      setMsg("Готово, обновляю…");
       window.location.reload();
     } catch (e) {
       setMsg("Ошибка сети: " + String(e)); setLoading(false);

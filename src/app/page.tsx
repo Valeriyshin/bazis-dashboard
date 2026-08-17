@@ -75,7 +75,7 @@ export default function Page() {
       {tab === "Сводка" && <Summary summary={data.summary} />}
       {tab === "Google Ads" && <GoogleAds metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} />}
       {tab === "Яндекс" && <YandexAds />}
-      {tab === "TikTok" && <TiktokAds />}
+      {tab === "TikTok" && <TiktokAds metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} />}
       {tab === "Выгорание" && <FatigueTracker />}
       {tab === "Сверка продаж" && <SalesReconcile />}
     </div>
@@ -1059,7 +1059,7 @@ interface TData {
   daily: { date: string; spend: number; impressions: number; clicks: number; conversions: number }[];
   campaigns: (TCampaign & { ctr: number; cost_per_conversion: number; status: string })[];
 }
-function TiktokAds() {
+function TiktokAds({ metaPeriod }: { metaPeriod?: { start: string; end: string } }) {
   const [t, setT] = useState<TData | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [metric, setMetric] = useState<"spend" | "clicks" | "conversions" | "impressions">("spend");
@@ -1067,11 +1067,22 @@ function TiktokAds() {
   const [asc, setAsc] = useState(false);
 
   useEffect(() => {
-    fetch("/api/tiktok").then((r) => r.json()).then((d) => { d.error ? setErr(d.error) : setT(d); }).catch((e) => setErr(String(e)));
-  }, []);
+    // Если выбран период (тот же, что у Meta) — запрашиваем дневные суммы именно за него:
+    // они накапливаются в базе непрерывно и доступны, даже когда сама выгрузка кампаний
+    // из TikTok API давно не обновлялась (например, кабинет временно недоступен) —
+    // так хотя бы КПЭ/график совпадают с остальным дашбордом, а не показывают случайное
+    // окно последнего успешного синка.
+    const qs = metaPeriod ? `?since=${metaPeriod.start}&until=${metaPeriod.end}` : "";
+    fetch("/api/tiktok" + qs).then((r) => r.json()).then((d) => { d.error ? setErr(d.error) : setT(d); }).catch((e) => setErr(String(e)));
+  }, [metaPeriod?.start, metaPeriod?.end]);
 
   if (err) return <div className="panel err">Ошибка: {err}<div className="muted" style={{ marginTop: 8 }}>Запустите <code>npm run sync:tiktok</code>.</div></div>;
   if (!t) return <div className="center muted">Загрузка TikTok…</div>;
+
+  // Кампании/группы объявлений обновляются только полным синком с TikTok API — если он
+  // давно не проходил (например, кабинет потерял доступ), их разбивка отстаёт от периода
+  // дневных сумм выше, хотя сами суммы уже за нужный период.
+  const campaignsStale = metaPeriod && (metaPeriod.start !== t.snapshot.period_start || metaPeriod.end !== t.snapshot.period_end);
 
   const T = t.daily.reduce((a, r) => ({ spend: a.spend + r.spend, impressions: a.impressions + r.impressions, clicks: a.clicks + r.clicks, conversions: a.conversions + r.conversions }), { spend: 0, impressions: 0, clicks: 0, conversions: 0 });
   const money = (n: number) => "$" + n.toLocaleString("ru-RU", { maximumFractionDigits: n < 100 ? 2 : 0 });
@@ -1104,8 +1115,18 @@ function TiktokAds() {
     <>
       <div className="panel">
         <div className="panel-title">
-          TikTok{t.snapshot.advertiser_id ? ` · ${t.snapshot.advertiser_id}` : ""} · {new Date(t.snapshot.period_start).toLocaleDateString("ru-RU")} — {new Date(t.snapshot.period_end).toLocaleDateString("ru-RU")}
+          TikTok{t.snapshot.advertiser_id ? ` · ${t.snapshot.advertiser_id}` : ""} ·{" "}
+          {metaPeriod
+            ? <>{new Date(metaPeriod.start).toLocaleDateString("ru-RU")} — {new Date(metaPeriod.end).toLocaleDateString("ru-RU")}</>
+            : <>{new Date(t.snapshot.period_start).toLocaleDateString("ru-RU")} — {new Date(t.snapshot.period_end).toLocaleDateString("ru-RU")}</>}
         </div>
+        {campaignsStale && (
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+            КПЭ и график выше — за выбранный период (данные накапливаются в базе непрерывно). А разбивка по кампаниям
+            ниже — из последнего успешного синка с TikTok API, за {new Date(t.snapshot.period_start).toLocaleDateString("ru-RU")} —{" "}
+            {new Date(t.snapshot.period_end).toLocaleDateString("ru-RU")} — обновится, когда синк снова заработает.
+          </div>
+        )}
         <div className="kpi-grid">
           {kpis.map((k) => (<div className="kpi" key={k.l}><div className="label">{k.l}</div><div className="value">{k.v}</div></div>))}
         </div>

@@ -10,7 +10,7 @@ import {
   METRICS, METRIC_BY_KEY, DEFAULT_KPI_KEYS, DailyRow,
   sumRows, metricValue, formatMetric, delta,
 } from "@/lib/metrics";
-import type { ReconciliationResult } from "@/lib/salesRecon";
+import type { ReconciliationResult, MediaPlanRow } from "@/lib/salesRecon";
 
 interface Entity {
   campaign_id?: string; adset_id?: string; ad_id?: string; name: string; status: string;
@@ -27,7 +27,7 @@ interface ApiData {
   summary: { author: string; created_at: string; data: SummaryData | null } | null;
 }
 
-const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "TikTok", "Сводка", "Выгорание", "Сверка продаж"] as const;
+const TABS = ["Обзор", "Meta", "Google Ads", "Яндекс", "TikTok", "Сводка", "Выгорание", "Сверка продаж", "Медиаплан"] as const;
 type Tab = (typeof TABS)[number];
 const LINE_COLORS = ["#4f8cff", "#34d399", "#f59e0b", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#facc15", "#60a5fa", "#4ade80", "#fb923c"];
 
@@ -78,6 +78,7 @@ export default function Page() {
       {tab === "TikTok" && <TiktokAds metaPeriod={{ start: data.snapshot.period_start, end: data.snapshot.period_end }} />}
       {tab === "Выгорание" && <FatigueTracker />}
       {tab === "Сверка продаж" && <SalesReconcile />}
+      {tab === "Медиаплан" && <MediaPlanTab />}
     </div>
   );
 }
@@ -1626,7 +1627,7 @@ async function readSheet(file: File): Promise<SheetRow[]> {
   return XLSX.utils.sheet_to_json<SheetRow>(ws, { header: 1, defval: "" }) as unknown as SheetRow[];
 }
 
-interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string; meeting: boolean }
+interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string; meeting: boolean; stage: string; callResult: string }
 interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string; propType: string; number: string }
 interface ReconRow { channel: string; leadsTotal: number; deals: number; sum: number }
 interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string; client: string }
@@ -1927,6 +1928,10 @@ function SalesReconcile() {
       client: findCol(lHeaders, "клиент"),
       descr: findCol(lHeaders, "описание"),
       meeting: findCol(lHeaders, "встреча"),
+      // "Стадия" ("В работе"/"Потеряна"/"Закрыта"/"Встреча состоялась") и "Результат
+      // звонка" (лог попыток дозвона) — для медиаплана: доля необработанных лидов.
+      stage: findCol(lHeaders, "стадия"),
+      callResult: findCol(lHeaders, "результат звонка"),
     };
     const out: LeadRow[] = [];
     for (let i = lh + 1; i < leadRows.length; i++) {
@@ -1942,6 +1947,8 @@ function SalesReconcile() {
         descr: String(r[lCol.descr] ?? "").trim(),
         // «Встреча назначена» / «Встреча не назначена» — признак квалифицированного лида.
         meeting: /встреча\s+назначена/i.test(String(r[lCol.meeting] ?? "")),
+        stage: lCol.stage >= 0 ? String(r[lCol.stage] ?? "").trim() : "",
+        callResult: lCol.callResult >= 0 ? String(r[lCol.callResult] ?? "").trim() : "",
       };
       const phones = normPhones(r[lCol.phone]);
       // Лид без телефона, но с ФИО тоже сохраняем: карточку могли заполнить плохо,
@@ -2133,7 +2140,7 @@ function SalesReconcile() {
     if (ad && (!c.date || !ad.date || sortableAdDate(ad.date) <= sortableDate(c.date))) {
       return {
         contract: c,
-        lead: { phone: ad.phone, channel: "Центр лидов", source: AD_SOURCE, object: "", date: ad.date, client: ad.client, descr: "", meeting: false },
+        lead: { phone: ad.phone, channel: "Центр лидов", source: AD_SOURCE, object: "", date: ad.date, client: ad.client, descr: "", meeting: false, stage: "", callResult: "" },
         by: "ads" as const,
       };
     }
@@ -2696,6 +2703,132 @@ function SalesReconcile() {
             </div>
           </div>
         </>
+      )}
+    </>
+  );
+}
+
+/* ============ Медиаплан: CPL/качество по ЖК × площадка, рекомендация по бюджету ============ */
+const RECOMMEND_COLOR: Record<string, string> = {
+  "Поднять бюджет (+20%)": "var(--good)",
+  "Снизить бюджет (−30%)": "#f59e0b",
+  "Рассмотреть отключение": "var(--bad, #f87171)",
+  "Оставить как есть": "var(--muted)",
+  "Недостаточно данных": "var(--muted)",
+};
+function prevMonthRange(): { since: string; until: string } {
+  const now = new Date();
+  const firstThis = new Date(now.getFullYear(), now.getMonth(), 1);
+  const lastPrev = new Date(firstThis.getTime() - 86400000);
+  const firstPrev = new Date(lastPrev.getFullYear(), lastPrev.getMonth(), 1);
+  const iso = (d: Date) => d.toISOString().slice(0, 10);
+  return { since: iso(firstPrev), until: iso(lastPrev) };
+}
+
+function MediaPlanTab() {
+  const def = prevMonthRange();
+  const [since, setSince] = useState(def.since);
+  const [until, setUntil] = useState(def.until);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [data, setData] = useState<{
+    rows: MediaPlanRow[];
+    platformPeriods: Record<string, { start: string; end: string } | null>;
+    leadsPeriod: { since: string; until: string };
+  } | null>(null);
+
+  const run = async () => {
+    setLoading(true); setErr(null); setData(null);
+    try {
+      const qs = new URLSearchParams({ since, until });
+      const res = await fetch("/api/media-plan?" + qs.toString());
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      setData(j);
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setLoading(false);
+  };
+  useEffect(() => { run(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, []);
+
+  const money = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
+  const byZhk = new Map<string, MediaPlanRow[]>();
+  for (const r of data?.rows ?? []) {
+    const arr = byZhk.get(r.zhk);
+    if (arr) arr.push(r); else byZhk.set(r.zhk, [r]);
+  }
+  const zhkNames = [...byZhk.keys()].sort();
+
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-title">Медиаплан: CPL и качество лидов по ЖК × площадка</div>
+        <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+          Лиды — из накопленной базы, ровно за выбранный период. Расход по площадкам — из <b>последнего сохранённого
+          синка</b> каждой площадки (своей истории по месяцам у кампаний ещё нет) — перед тем как смотреть медиаплан,
+          обновите кампании кнопкой «↻ Обновить» с периодом = нужный месяц, иначе расход будет за другой период
+          (это будет явно показано под таблицей). Источник восстанавливается из «Описания» карточки лида — только
+          лиды с определённым источником (Instagram/Google Ads/Yandex Direct/TikTok) попадают в расчёт, органика/сайт —
+          нет бюджета, сравнивать не с чем.
+          <br />Рекомендация — сравнение CPL и конверсии в квал-лид каждого ЖК со <b>средним по той же площадке</b> за
+          этот период (не месяц-к-месяцу — для тренда нужна история кампаний по месяцам, которой пока нет).
+        </div>
+        <div className="controls">
+          <div className="field"><label>С</label><input type="date" value={since} onChange={(e) => setSince(e.target.value)} /></div>
+          <div className="field"><label>По</label><input type="date" value={until} onChange={(e) => setUntil(e.target.value)} /></div>
+          <button className="btn" onClick={run} disabled={loading} style={{ alignSelf: "end" }}>
+            {loading ? "⏳ Считаю…" : "Построить медиаплан"}
+          </button>
+        </div>
+        {err && <div className="err" style={{ marginTop: 10 }}>{err}</div>}
+      </div>
+
+      {data && (
+        <div className="panel">
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+            Лиды за {data.leadsPeriod.since} — {data.leadsPeriod.until} ({data.rows.reduce((s, r) => s + r.leads, 0).toLocaleString("ru-RU")} уникальных с определённой площадкой). Расход по площадкам за:{" "}
+            {Object.entries(data.platformPeriods).map(([p, period]) => (
+              <span key={p} style={{ marginRight: 10 }}>
+                <b>{p}</b>: {period ? `${period.start} — ${period.end}` : "нет данных"}
+              </span>
+            ))}
+          </div>
+          <div className="table-scroll">
+            <table>
+              <thead><tr>
+                <th>ЖК</th><th>Площадка</th><th>Расход</th><th>Лидов</th><th>CPL</th>
+                <th>Квал-лидов</th><th>CR в квал</th><th>% необработанных</th>
+                <th>Средний CPL по площадке</th><th>Рекомендация</th><th>Бюджет на след. месяц</th><th>Почему</th>
+              </tr></thead>
+              <tbody>
+                {zhkNames.map((zhk) => byZhk.get(zhk)!.map((r, i) => (
+                  <tr key={zhk + r.platform}>
+                    {i === 0 && <td rowSpan={byZhk.get(zhk)!.length} style={{ fontWeight: 600, verticalAlign: "top" }}>{zhk}</td>}
+                    <td>{r.platform}</td>
+                    <td>{r.spend ? money(r.spend) : "—"}</td>
+                    <td>{r.leads || "—"}</td>
+                    <td>{r.cpl ? money(r.cpl) : "—"}</td>
+                    <td>{r.qual || "—"}</td>
+                    <td>{r.leads ? (r.crQual * 100).toFixed(1) + "%" : "—"}</td>
+                    <td style={r.unprocessedPct >= 0.3 ? { color: "#f59e0b" } : undefined}>
+                      {r.leads ? (r.unprocessedPct * 100).toFixed(0) + "%" : "—"}
+                    </td>
+                    <td>{r.benchmarkCpl ? money(r.benchmarkCpl) : "—"}</td>
+                    <td style={{ color: RECOMMEND_COLOR[r.recommendation] ?? undefined, fontWeight: 600 }}>{r.recommendation}</td>
+                    <td>{money(r.suggestedBudget)}</td>
+                    <td style={{ maxWidth: 360, fontSize: 12 }} className="muted">{r.explanation}</td>
+                  </tr>
+                )))}
+              </tbody>
+            </table>
+          </div>
+          <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+            «% необработанных» — доля лидов ЖК/площадки, у которых стадия «В работе», а дозвониться так и не смогли
+            (недозвон/перезвонить/номер вне зоны). Если она высокая — сначала стоит проверить обработку колл-центром,
+            прежде чем менять рекламный бюджет: возможно, дело не в качестве трафика.
+          </div>
+        </div>
       )}
     </>
   );

@@ -4,7 +4,10 @@
 // и гонять их через браузер нельзя, поэтому агрегация считается в API-роуте и
 // наружу отдаётся уже готовый результат, а не сырые строки).
 
-export interface LeadRow { phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string; meeting: boolean }
+export interface LeadRow {
+  phone: string; channel: string; source: string; object: string; date: string; client: string; descr: string; meeting: boolean;
+  stage: string; callResult: string; // "Стадия" ("В работе"/"Потеряна"/"Закрыта"/"Встреча состоялась") и "Результат звонка" — для медиаплана (% необработанных лидов)
+}
 export interface ContractRow { phones: string[]; sum: number; zhk: string; status: string; date: string; client: string; city: string; propType: string; number: string }
 export interface ReconRow { channel: string; leadsTotal: number; qual: number; deals: number; sum: number; buyers: number }
 export interface AdLeadRow { phone: string; campaign: string; adset: string; ad: string; date: string; client: string }
@@ -91,8 +94,8 @@ export function inferSource(descr: string): string | null {
     if (/^(site|сайт|website)/.test(v)) return "Сайт жилого комплекса";
     if (/instagram|^ig$/.test(v)) return "Instagram";
     if (/facebook|^fb$/.test(v)) return "Instagram"; // тот же кабинет Meta, что и Instagram
-    if (/google/.test(v)) return "Поисковая рекл. Google/Яндекс";
-    if (/yandex|яндекс/.test(v)) return "Поисковая рекл. Google/Яндекс";
+    if (/google/.test(v)) return "Google Ads";
+    if (/yandex|яндекс/.test(v)) return "Yandex Direct";
     if (/tiktok/.test(v)) return "TikTok";
     return v.charAt(0).toUpperCase() + v.slice(1) + " (UTM)";
   }
@@ -120,6 +123,26 @@ export function sourceOf(l: LeadRow): string {
   const inferred = inferSource(l.descr);
   if (inferred) return inferred;
   return manual || "(не заполнено)";
+}
+
+// Источник, восстановленный из "Описания" ("Instagram"/"Google Ads"/"Yandex Direct"/
+// "TikTok") — это ровно то же, что и площадка, на которую есть рекламный бюджет
+// (для медиаплана). Источники без рекламного бюджета (сайт, рекомендации,
+// оффлайн-каналы, "не заполнено") в эту карту не попадают — для них нет CPL.
+export const CHANNEL_TO_PLATFORM: Record<string, string> = {
+  "Instagram": "Meta", "Google Ads": "Google Ads", "Yandex Direct": "Yandex Direct", "TikTok": "TikTok",
+};
+export function platformOf(l: LeadRow): string | null {
+  return CHANNEL_TO_PLATFORM[sourceOf(l)] ?? null;
+}
+
+// "Необработан" — лид всё ещё открыт ("Стадия" = "В работе"), а результативного
+// дозвона так и не было: либо результат ещё не зафиксирован, либо все попытки —
+// недозвон/перезвонить/не смогли дозвониться. Закрытые, потерянные и лиды со
+// встречей сюда не попадают — по ним решение уже принято (не важно, какое).
+const UNPROCESSED_RESULTS = new Set(["", "Недозвон", "Перезвонить", "Клиент перезвонит сам", "Нет дозвона на межнар. номера"]);
+export function isUnprocessed(l: LeadRow): boolean {
+  return l.stage === "В работе" && UNPROCESSED_RESULTS.has((l.callResult || "").trim());
 }
 
 /* ---------- разбор названий кампаний рекламных кабинетов → ЖК (для воронки) ---------- */
@@ -308,7 +331,7 @@ export function buildReconciliation(
     if (ad && (!c.date || !ad.date || sortableAdDate(ad.date) <= sortableDate(c.date))) {
       return {
         contract: c,
-        lead: { phone: ad.phone, channel: "Центр лидов", source: AD_SOURCE, object: "", date: ad.date, client: ad.client, descr: "", meeting: false },
+        lead: { phone: ad.phone, channel: "Центр лидов", source: AD_SOURCE, object: "", date: ad.date, client: ad.client, descr: "", meeting: false, stage: "", callResult: "" },
         by: "ads" as const,
       };
     }
@@ -468,4 +491,130 @@ export function buildReconciliation(
     reconRows, funnelRows, funnelTotal, cohortRows,
     overallMedian, overallAvg, cycleSamples: allCycleDays.length,
   };
+}
+
+/* ---------- медиаплан: CPL/качество по ЖК × площадка, рекомендация по бюджету ---------- */
+
+export interface MediaPlanRow {
+  zhk: string; platform: string;
+  spend: number; leads: number; cpl: number;
+  qual: number; crQual: number;
+  unprocessed: number; unprocessedPct: number;
+  benchmarkCpl: number; benchmarkCrQual: number;
+  recommendation: string; explanation: string; suggestedBudget: number;
+}
+
+const PLATFORM_ORDER = ["Meta", "Google Ads", "Yandex Direct", "TikTok"];
+
+// Сводит расход рекламных кабинетов и лиды CRM в одну таблицу по (ЖК × площадка) за
+// период, сравнивает CPL/конверсию в квал каждого ЖК со средним по ТОЙ ЖЕ площадке
+// (в рамках периода — без сравнения месяц-к-месяцу, для этого нужен архив снапшотов
+// кампаний по месяцам, которого пока нет) и даёт рекомендацию по бюджету.
+export function buildMediaPlan(
+  leads: LeadRow[],
+  campaignsByPlatform: Record<string, { name: string; spend: number }[]>,
+): MediaPlanRow[] {
+  const canon = new Map<string, string>();
+  const spend: Record<string, Record<string, number>> = {};
+  const displayName: Record<string, string> = {};
+  for (const platform of PLATFORM_ORDER) {
+    for (const c of campaignsByPlatform[platform] ?? []) {
+      const label = resolveZhk(c.name, canon);
+      const k = zhkKey(label);
+      if (!k) continue;
+      displayName[k] ??= label;
+      (spend[k] ??= {})[platform] = (spend[k]?.[platform] ?? 0) + (c.spend || 0);
+    }
+  }
+
+  // "\u0000" — служебный разделитель ключа (ЖК/площадка/id не могут его содержать).
+  const leadIds: Record<string, Set<string>> = {};
+  const qualIds: Record<string, Set<string>> = {};
+  const latestByKey = new Map<string, LeadRow>();
+  for (const l of leads) {
+    const platform = platformOf(l);
+    if (!platform) continue; // источники без рекламного бюджета в медиаплан не входят
+    const zk = zhkKey(l.object);
+    if (!zk) continue;
+    const id = l.phone || nameKey(l.client);
+    if (!id) continue;
+    const bucketKey = `${zk}\u0000${platform}`;
+    (leadIds[bucketKey] ??= new Set()).add(id);
+    if (l.meeting) (qualIds[bucketKey] ??= new Set()).add(id);
+    const idKey = `${bucketKey}\u0000${id}`;
+    const prev = latestByKey.get(idKey);
+    if (!prev || sortableDate(l.date) > sortableDate(prev.date)) latestByKey.set(idKey, l);
+  }
+  const unprocessedIds: Record<string, Set<string>> = {};
+  for (const [idKey, l] of latestByKey) {
+    if (!isUnprocessed(l)) continue;
+    const parts = idKey.split("\u0000");
+    const bucketKey = `${parts[0]}\u0000${parts[1]}`;
+    (unprocessedIds[bucketKey] ??= new Set()).add(parts[2]);
+  }
+
+  const allKeys = new Set<string>();
+  for (const zk of Object.keys(spend)) for (const p of Object.keys(spend[zk])) allKeys.add(`${zk}\u0000${p}`);
+  for (const k of Object.keys(leadIds)) allKeys.add(k);
+
+  const rawRows: { zhk: string; platform: string; spend: number; leads: number; qual: number; unprocessed: number }[] = [];
+  for (const key of allKeys) {
+    const [zk, platform] = key.split("\u0000");
+    const sp = spend[zk]?.[platform] ?? 0;
+    const ld = leadIds[key]?.size ?? 0;
+    const q = qualIds[key]?.size ?? 0;
+    const un = unprocessedIds[key]?.size ?? 0;
+    if (!sp && !ld) continue;
+    rawRows.push({ zhk: displayName[zk] ?? zk, platform, spend: sp, leads: ld, qual: q, unprocessed: un });
+  }
+
+  const benchByPlatform: Record<string, { cpl: number; crQual: number }> = {};
+  for (const platform of PLATFORM_ORDER) {
+    const rows = rawRows.filter((r) => r.platform === platform && r.spend > 0 && r.leads > 0);
+    if (!rows.length) { benchByPlatform[platform] = { cpl: 0, crQual: 0 }; continue; }
+    const cpls = rows.map((r) => r.spend / r.leads);
+    const crs = rows.map((r) => r.qual / r.leads);
+    benchByPlatform[platform] = {
+      cpl: cpls.reduce((a, b) => a + b, 0) / cpls.length,
+      crQual: crs.reduce((a, b) => a + b, 0) / crs.length,
+    };
+  }
+
+  const money0 = (n: number) => Math.round(n).toLocaleString("ru-RU");
+  const rows: MediaPlanRow[] = rawRows.map((r) => {
+    const cpl = r.leads ? r.spend / r.leads : 0;
+    const crQual = r.leads ? r.qual / r.leads : 0;
+    const unprocessedPct = r.leads ? r.unprocessed / r.leads : 0;
+    const bench = benchByPlatform[r.platform] ?? { cpl: 0, crQual: 0 };
+    let recommendation = "Оставить как есть", suggestedBudget = r.spend, explanation = "";
+    if (!r.spend || !r.leads || !bench.cpl) {
+      recommendation = "Недостаточно данных";
+      explanation = "Мало лидов или расхода за период для сравнения — рекомендация будет надёжнее на следующий месяц.";
+    } else if (cpl >= bench.cpl * 2 && crQual <= bench.crQual * 0.5) {
+      recommendation = "Рассмотреть отключение";
+      suggestedBudget = 0;
+      explanation = `CPL ${money0(cpl)} ₸ — почти вдвое выше среднего по площадке (${money0(bench.cpl)} ₸), а конверсия в квал ${(crQual * 100).toFixed(1)}% вдвое хуже среднего (${(bench.crQual * 100).toFixed(1)}%). Площадка стабильно приводит дорогих и некачественных лидов по этому ЖК.`;
+    } else if (cpl >= bench.cpl * 1.3 || crQual < bench.crQual * 0.7) {
+      recommendation = "Снизить бюджет (−30%)";
+      suggestedBudget = r.spend * 0.7;
+      explanation = `CPL ${money0(cpl)} ₸ выше среднего по площадке (${money0(bench.cpl)} ₸) или конверсия в квал (${(crQual * 100).toFixed(1)}%) ниже среднего (${(bench.crQual * 100).toFixed(1)}%) — эффективность ниже, чем у других ЖК на этой же площадке.`;
+    } else if (cpl <= bench.cpl * 0.9 && crQual >= bench.crQual) {
+      recommendation = "Поднять бюджет (+20%)";
+      suggestedBudget = r.spend * 1.2;
+      explanation = `CPL ${money0(cpl)} ₸ ниже среднего по площадке (${money0(bench.cpl)} ₸), конверсия в квал ${(crQual * 100).toFixed(1)}% не хуже среднего (${(bench.crQual * 100).toFixed(1)}%) — площадка эффективно приводит лидов по этому ЖК, есть смысл масштабировать.`;
+    } else {
+      explanation = `CPL ${money0(cpl)} ₸ и конверсия в квал ${(crQual * 100).toFixed(1)}% на уровне среднего по площадке — оснований менять бюджет нет.`;
+    }
+    if (unprocessedPct >= 0.3) {
+      explanation += ` Внимание: ${(unprocessedPct * 100).toFixed(0)}% лидов этого ЖК/площадки до сих пор не дозвонились — прежде чем менять бюджет, стоит проверить обработку.`;
+    }
+    return {
+      zhk: r.zhk, platform: r.platform, spend: r.spend, leads: r.leads, cpl,
+      qual: r.qual, crQual, unprocessed: r.unprocessed, unprocessedPct,
+      benchmarkCpl: bench.cpl, benchmarkCrQual: bench.crQual,
+      recommendation, explanation, suggestedBudget,
+    };
+  });
+
+  return rows.sort((a, b) => a.zhk.localeCompare(b.zhk) || a.platform.localeCompare(b.platform));
 }

@@ -47,15 +47,64 @@ function headers() {
 
 // Reports API отдаёт TSV. Возвращает { cols, rows } — заголовок нужен, чтобы
 // разобрать динамические колонки вида Conversions_<goalId>_<attribution>.
-async function report(body) {
-  for (let attempt = 0; attempt < 12; attempt++) {
-    const res = await fetch(reportsUrl(), { method: "POST", headers: headers(), body: JSON.stringify(body) });
+// У Яндекса два РАЗНЫХ ограничения, и оба легко нарушить, ускоряя синк:
+//   506 — «превышено ограничение на количество соединений» (сколько запросов
+//         выполняется ОДНОВРЕМЕННО);
+//   56  — «не чаще 20 раз в 10 секунд» (ЧАСТОТА запросов к методу).
+// Поэтому ограничиваем и то, и другое: семафор на параллельность и глобальный
+// минимальный интервал между любыми обращениями к API. Интервал общий на модуль,
+// иначе частый опрос готовности отчёта у нескольких параллельных отчётов
+// суммарно выходит за 20/10с даже при небольшой параллельности.
+const MAX_PARALLEL_REPORTS = 3;
+const MIN_REQUEST_INTERVAL = 700; // ~14 запросов за 10с — с запасом под лимит в 20
+
+let inFlight = 0;
+const waiting = [];
+async function withSlot(fn) {
+  if (inFlight >= MAX_PARALLEL_REPORTS) await new Promise((r) => waiting.push(r));
+  inFlight++;
+  try { return await fn(); }
+  finally { inFlight--; waiting.shift()?.(); }
+}
+
+let nextSlot = 0;
+// Ставит вызовы в общую очередь так, чтобы между ними было не меньше
+// MIN_REQUEST_INTERVAL, сколько бы параллельных отчётов ни ждало ответа.
+async function rateLimited(fn) {
+  const now = Date.now();
+  const at = Math.max(now, nextSlot);
+  nextSlot = at + MIN_REQUEST_INTERVAL;
+  if (at > now) await new Promise((r) => setTimeout(r, at - now));
+  return fn();
+}
+
+function report(body) {
+  return withSlot(() => reportInner(body));
+}
+
+async function reportInner(body) {
+  // Ожидание готовности отчёта: раньше между попытками всегда спали ровно 5 секунд,
+  // и на маленьких отчётах (а они почти все такие) это добавляло 5с на ровном месте.
+  // Теперь начинаем с 800мс и плавно увеличиваем до 5с — суммарный потолок ожидания
+  // тот же, но готовый отчёт забираем почти сразу.
+  let wait = 800;
+  for (let attempt = 0; attempt < 16; attempt++) {
+    const res = await rateLimited(() => fetch(reportsUrl(), { method: "POST", headers: headers(), body: JSON.stringify(body) }));
     // 201/202 — отчёт ставится в очередь, надо подождать и повторить тот же запрос.
     if (res.status === 201 || res.status === 202) {
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, wait));
+      wait = Math.min(wait * 1.6, 5000);
       continue;
     }
     const text = await res.text();
+    // 506 (одновременные соединения) и 56 (частота запросов) — временные лимиты
+    // аккаунта. Упереться в них можно и не по своей вине: параллельный синк,
+    // чужой скрипт на том же аккаунте. Ждём и повторяем, а не валим синк площадки.
+    if (!res.ok && (text.includes('"error_code":"506"') || text.includes('"error_code":"56"'))) {
+      await new Promise((r) => setTimeout(r, wait));
+      wait = Math.min(wait * 1.6, 5000);
+      continue;
+    }
     if (!res.ok) throw new Error(`Yandex Direct API ${res.status}: ${text.slice(0, 400)}`);
     const lines = text.trim().split("\n").filter(Boolean);
     if (lines.length < 2) return { cols: [], rows: [] };
@@ -78,7 +127,7 @@ async function api(service, method, params) {
   const base = process.env.YANDEX_SANDBOX === "1"
     ? "https://api-sandbox.direct.yandex.com/json/v5/"
     : "https://api.direct.yandex.com/json/v5/";
-  const res = await fetch(base + service, { method: "POST", headers: h, body: JSON.stringify({ method, params }) });
+  const res = await rateLimited(() => fetch(base + service, { method: "POST", headers: h, body: JSON.stringify({ method, params }) }));
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { throw new Error(`Yandex ${service}: не JSON — ${text.slice(0, 200)}`); }
@@ -157,20 +206,23 @@ async function goalConversions(campaignGoals, sinceR, untilR, groupField) {
   const out = {}; // date или campaignId -> сумма конверсий
   const allGoals = [...new Set(Object.values(campaignGoals).flat())];
   if (!allGoals.length) return out;
-  for (const batch of chunk(allGoals, 10)) {
-    const { cols, rows } = await report({
-      params: {
-        SelectionCriteria: { DateFrom: sinceR, DateTo: untilR },
-        FieldNames: groupField === "Date" ? ["Date", "CampaignId", "Conversions"] : ["CampaignId", "Conversions"],
-        ReportName: `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        ReportType: "CAMPAIGN_PERFORMANCE_REPORT",
-        DateRangeType: "CUSTOM_DATE",
-        Format: "TSV",
-        IncludeVAT: "NO",
-        IncludeDiscount: "NO",
-        Goals: batch,
-      },
-    });
+  // Пачки целей запрашиваем параллельно: раньше они шли одна за другой, и каждая
+  // ждала своей очереди в Reports API — на этом Яндекс съедал больше времени, чем
+  // все остальные площадки вместе.
+  const batches = await Promise.all(chunk(allGoals, 10).map((batch) => report({
+    params: {
+      SelectionCriteria: { DateFrom: sinceR, DateTo: untilR },
+      FieldNames: groupField === "Date" ? ["Date", "CampaignId", "Conversions"] : ["CampaignId", "Conversions"],
+      ReportName: `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      ReportType: "CAMPAIGN_PERFORMANCE_REPORT",
+      DateRangeType: "CUSTOM_DATE",
+      Format: "TSV",
+      IncludeVAT: "NO",
+      IncludeDiscount: "NO",
+      Goals: batch,
+    },
+  })));
+  for (const { cols, rows } of batches) {
     const goalCols = cols.filter((c) => /^Conversions_\d+_/.test(c)).map((c) => [c, c.match(/^Conversions_(\d+)_/)[1]]);
     for (const r of rows) {
       const cid = String(r.CampaignId);
@@ -240,10 +292,18 @@ export async function runYandexSync(opts = {}) {
     fetchRanges.push([tailStart, until]);
   }
 
+  // Отчёт по дням и конверсии по целям независимы — запрашиваем их сразу вместе,
+  // а не одно после другого (каждый отчёт отдельно ждёт очереди в Reports API).
+  // Диапазоны дат тоже тянем параллельно.
+  const perRange = await Promise.all(fetchRanges.map(async ([rs, ru]) => {
+    const [{ rows }, convByDate] = await Promise.all([
+      report(base("daily", rs, ru, ["Date", "Impressions", "Clicks", "Cost"])),
+      goalsOk ? goalConversions(campaignGoals, rs, ru, "Date") : Promise.resolve({}),
+    ]);
+    return { rows, convByDate };
+  }));
   const freshByDate = new Map();
-  for (const [rs, ru] of fetchRanges) {
-    const { rows } = await report(base("daily", rs, ru, ["Date", "Impressions", "Clicks", "Cost"]));
-    const convByDate = goalsOk ? await goalConversions(campaignGoals, rs, ru, "Date") : {};
+  for (const { rows, convByDate } of perRange) {
     for (const r of rows) {
       freshByDate.set(r.Date, { date: r.Date, spend: money(r.Cost), impressions: num(r.Impressions), clicks: num(r.Clicks), conversions: convByDate[r.Date] || 0 });
     }
@@ -255,9 +315,11 @@ export async function runYandexSync(opts = {}) {
     if (k) daily.push({ date: d, spend: num(k.spend), impressions: num(k.impressions), clicks: num(k.clicks), conversions: num(k.conversions) });
   }
 
-  // Кампании — короткое окно, как раньше.
-  const campBase = await report(base("campaigns", sinceEntity, until, ["CampaignId", "CampaignName", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc"]));
-  const convByCampaign = goalsOk ? await goalConversions(campaignGoals, sinceEntity, until, "CampaignId") : {};
+  // Кампании — короткое окно, как раньше. Отчёт и конверсии тоже параллельно.
+  const [campBase, convByCampaign] = await Promise.all([
+    report(base("campaigns", sinceEntity, until, ["CampaignId", "CampaignName", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc"])),
+    goalsOk ? goalConversions(campaignGoals, sinceEntity, until, "CampaignId") : Promise.resolve({}),
+  ]);
 
   const camps = campBase.rows.map((r) => {
     const spend = money(r.Cost);

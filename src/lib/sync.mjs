@@ -165,8 +165,14 @@ function accountIds() {
 // применяется: просто всегда просим весь [since,until] и получаем точные текущие суммы.
 async function fetchAccountMeta(acc, TOKEN, tr) {
   const q = (extra) => `${API}/act_${acc}/insights?time_range=${tr}&limit=500&${extra}&access_token=${TOKEN}`;
+  // Запрашиваем только АКТИВНЫЕ сущности, а не всю историю кабинета. Статус у нас
+  // бинарный (st(): ACTIVE либо PAUSED), и всё, чего нет в этой карте, ниже и так
+  // становится "PAUSED" — то есть результат идентичен, а данных на порядок меньше:
+  // в кабинете 2523 объявления за всё время (6 страниц, ~22с) против 195 активных
+  // (1 страница, ~0.6с).
+  const ACTIVE_ONLY = encodeURIComponent(JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]));
   const statusMap = async (edge) => {
-    const rows = await fetchAll(`${API}/act_${acc}/${edge}?fields=id,effective_status&limit=500&access_token=${TOKEN}`);
+    const rows = await fetchAll(`${API}/act_${acc}/${edge}?fields=id,effective_status&filtering=${ACTIVE_ONLY}&limit=500&access_token=${TOKEN}`);
     return Object.fromEntries(rows.map((r) => [r.id, st(r.effective_status)]));
   };
   const [info, camps, adsets, ads, campStatus, adsetStatus, adStatus] = await Promise.all([

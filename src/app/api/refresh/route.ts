@@ -14,29 +14,29 @@ export async function POST(req: NextRequest) {
     since = body.since; until = body.until; days = body.days ? Number(body.days) : undefined;
   } catch { /* тело необязательно */ }
 
-  try {
-    const meta = await runSync({ since, until, days });
-    // Google Ads — тем же периодом; best-effort (не валим весь refresh, если нет кредов/доступа).
-    let google: unknown = null, googleError: string | null = null;
-    try {
-      google = await runGoogleAdsSync({ since, until, days });
-    } catch (e) {
-      googleError = (e as Error).message;
-    }
-    let yandex: unknown = null, yandexError: string | null = null;
-    try {
-      yandex = await runYandexSync({ since, until, days });
-    } catch (e) {
-      yandexError = (e as Error).message;
-    }
-    let tiktok: unknown = null, tiktokError: string | null = null;
-    try {
-      tiktok = await runTiktokSync({ since, until, days });
-    } catch (e) {
-      tiktokError = (e as Error).message;
-    }
-    return NextResponse.json({ ok: true, meta, google, googleError, yandex, yandexError, tiktok, tiktokError });
-  } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+  // Площадки синкаются параллельно: они независимы (разные API, разные таблицы),
+  // а последовательно это занимало сумму времени всех четырёх — на замере
+  // Meta 38.7с + Google 6.0с + Яндекс 110.9с + TikTok 8.9с = 164.6с, хотя реально
+  // нужно столько, сколько работает самая долгая из них.
+  const opts = { since, until, days };
+  const [meta, google, yandex, tiktok] = await Promise.allSettled([
+    runSync(opts), runGoogleAdsSync(opts), runYandexSync(opts), runTiktokSync(opts),
+  ]);
+
+  const err = (r: PromiseSettledResult<unknown>) =>
+    r.status === "rejected" ? String((r.reason as Error)?.message ?? r.reason) : null;
+  const val = (r: PromiseSettledResult<unknown>) => (r.status === "fulfilled" ? r.value : null);
+
+  // Meta — основная площадка: если упала она, это ошибка всего обновления (как и раньше).
+  // Остальные best-effort: их падение не мешает обновить то, что доступно.
+  if (meta.status === "rejected") {
+    return NextResponse.json({ error: err(meta) }, { status: 500 });
   }
+  return NextResponse.json({
+    ok: true,
+    meta: val(meta),
+    google: val(google), googleError: err(google),
+    yandex: val(yandex), yandexError: err(yandex),
+    tiktok: val(tiktok), tiktokError: err(tiktok),
+  });
 }

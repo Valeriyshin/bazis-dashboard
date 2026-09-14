@@ -3,6 +3,7 @@
 import { createClient } from "@libsql/client";
 import fs from "node:fs";
 import path from "node:path";
+import { reusePeriod } from "./reuse.mjs";
 
 function loadEnv() {
   const p = path.join(process.cwd(), ".env.local");
@@ -125,6 +126,22 @@ export async function runGoogleAdsSync(opts = {}) {
   const token = await accessToken();
   const conn = db();
   await conn.batch(SCHEMA, "write");
+
+  // Период уже выгружен и давно закрыт — данные окончательные, берём из базы.
+  const reused = await reusePeriod(conn, {
+    snapTable: "google_snapshots",
+    rowTables: ["google_daily", "google_campaigns", "google_adgroups"],
+    periodStart: sinceEntity, periodEnd: until, reconDays: RECON_DAYS,
+  });
+  if (reused) {
+    const cnt = async (t) => Number((await conn.execute({ sql: `SELECT COUNT(*) FROM ${t} WHERE snapshot_id=?`, args: [reused.snapshotId] })).rows[0][0]);
+    return {
+      snapshotId: reused.snapshotId, since: sinceEntity, until, fromCache: true,
+      days: await cnt("google_daily"),
+      campaigns: await cnt("google_campaigns"),
+      adgroups: await cnt("google_adgroups"),
+    };
+  }
   try { await conn.execute("ALTER TABLE google_campaigns ADD COLUMN channel TEXT"); } catch { /* уже есть */ }
 
   // Подневная статистика аккаунта — только окно сверки (там ещё досчитывается

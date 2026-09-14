@@ -3,6 +3,7 @@
 import { createClient } from "@libsql/client";
 import fs from "node:fs";
 import path from "node:path";
+import { reusePeriod } from "./reuse.mjs";
 
 // --- env (.env.local для CLI; в Next уже загружен) ---
 function loadEnv() {
@@ -248,6 +249,21 @@ export async function runSync(opts = {}) {
   await db.batch(SCHEMA, "write");
   // Миграция для уже созданных БД: добавить колонку leads, если её ещё нет.
   try { await db.execute("ALTER TABLE daily_insights ADD COLUMN leads INTEGER"); } catch { /* уже есть */ }
+
+  // Этот период уже выгружен и давно закрыт — берём из базы, в Graph API не идём.
+  const reused = await reusePeriod(db, {
+    snapTable: "snapshots",
+    rowTables: ["daily_insights", "campaign_insights", "adset_insights", "ad_insights", "summaries"],
+    periodStart: sinceEntity, periodEnd: until, reconDays: RECON_DAYS,
+  });
+  if (reused) {
+    const cnt = async (t) => Number((await db.execute({ sql: `SELECT COUNT(*) FROM ${t} WHERE snapshot_id=?`, args: [reused.snapshotId] })).rows[0][0]);
+    return {
+      snapshotId: reused.snapshotId, since: sinceEntity, until, fromCache: true,
+      days: await cnt("daily_insights"), campaigns: await cnt("campaign_insights"),
+      adsets: await cnt("adset_insights"), ads: await cnt("ad_insights"),
+    };
+  }
 
   // Кампании/группы/объявления — весь запрошенный (короткий) период одним вызовом на аккаунт.
   const trFull = encodeURIComponent(JSON.stringify({ since: sinceEntity, until }));

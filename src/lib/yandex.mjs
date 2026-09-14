@@ -3,6 +3,7 @@
 import { createClient } from "@libsql/client";
 import fs from "node:fs";
 import path from "node:path";
+import { reusePeriod } from "./reuse.mjs";
 
 function loadEnv() {
   const p = path.join(process.cwd(), ".env.local");
@@ -277,6 +278,21 @@ export async function runYandexSync(opts = {}) {
 
   const conn = db();
   await conn.batch(SCHEMA, "write");
+
+  // Период уже выгружен и давно закрыт — данные окончательные, берём из базы.
+  const reused = await reusePeriod(conn, {
+    snapTable: "yandex_snapshots",
+    rowTables: ["yandex_daily", "yandex_campaigns"],
+    periodStart: sinceEntity, periodEnd: until, reconDays: RECON_DAYS,
+  });
+  if (reused) {
+    const cnt = async (t) => Number((await conn.execute({ sql: `SELECT COUNT(*) FROM ${t} WHERE snapshot_id=?`, args: [reused.snapshotId] })).rows[0][0]);
+    return {
+      snapshotId: reused.snapshotId, since: sinceEntity, until, fromCache: true,
+      days: await cnt("yandex_daily"),
+      campaigns: await cnt("yandex_campaigns"),
+    };
+  }
 
   // Дневная статистика — только окно сверки + недостающая ранняя история;
   // остальное берём из того, что уже знаем по всем прошлым снапшотам.

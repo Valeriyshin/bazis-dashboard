@@ -35,6 +35,33 @@ function fmtDate(d: string) {
   return new Date(d).toLocaleDateString("ru-RU", { day: "2-digit", month: "short" });
 }
 
+/* ============ Переключатель светлой/тёмной темы ============ */
+type Theme = "dark" | "light";
+function ThemeToggle() {
+  // Стартовое значение читаем из уже проставленного атрибута (его выставил
+  // inline-скрипт в layout.tsx до отрисовки), а не из localStorage напрямую —
+  // так состояние компонента совпадает с тем, что реально нарисовано.
+  const [theme, setTheme] = useState<Theme>("dark");
+  useEffect(() => {
+    setTheme(document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark");
+  }, []);
+
+  const apply = (t: Theme) => {
+    setTheme(t);
+    document.documentElement.setAttribute("data-theme", t);
+    try { localStorage.setItem("theme", t); } catch { /* приватный режим — просто не запомним */ }
+  };
+
+  return (
+    <button type="button" className="theme-toggle" onClick={() => apply(theme === "dark" ? "light" : "dark")}
+      title={theme === "dark" ? "Включить светлую тему" : "Включить тёмную тему"}
+      aria-label={theme === "dark" ? "Включить светлую тему" : "Включить тёмную тему"}>
+      <span className={theme === "light" ? "on" : ""}>☀</span>
+      <span className={theme === "dark" ? "on" : ""}>☾</span>
+    </button>
+  );
+}
+
 export default function Page() {
   const [data, setData] = useState<ApiData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -59,14 +86,18 @@ export default function Page() {
           </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
-          <UserBar />
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <ThemeToggle />
+            <UserBar />
+          </div>
           <RefreshBar snapshot={data.snapshot} />
         </div>
       </div>
 
-      <div className="tabs">
+      <div className="tabs" role="tablist">
         {TABS.map((t) => (
-          <div key={t} className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{t}</div>
+          <button key={t} type="button" role="tab" aria-selected={tab === t}
+            className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{t}</button>
         ))}
       </div>
 
@@ -266,6 +297,10 @@ const CITY_LIST = ["Алматы", "Астана", "Шымкент", "Атыра
 // уровне группы объявлений (Meta: адсет, Google: ad group), а не в названии кампании.
 const HUB_RE = /\bhub\b/i;
 
+// У Яндекса расход с налогами считается не как (1+АК), а с фиксированным
+// коэффициентом — см. выгрузку в Excel.
+const YA_TAX_COEF = 0.95;
+
 function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: Entity[]; metaAdsets: Entity[]; metaPeriod: { start: string; end: string } }) {
   const [google, setGoogle] = useState<GCampaign[] | null>(null);
   const [googleAdgroups, setGoogleAdgroups] = useState<GAdgroup[]>([]);
@@ -320,8 +355,11 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
   // (ручной курс приоритетнее авто-курса НБ РК, если заполнен).
   const taxRate = Number(exportRate) || rate;
   const ak = akPct / 100, nds = ndsPct / 100;
-  const YA_TAX_COEF = 0.95; // у Яндекса не (1+АК), а фиксированный коэффициент — см. выгрузку в Excel
 
+  // Полная пересборка сводки по всем кампаниям всех площадок (разбор названий в ЖК —
+  // регулярки по каждому кандидату против каждого известного ЖК). В useMemo, чтобы это
+  // не повторялось при кликах по сортировке и переключении колонок.
+  const { group, zhkTotal } = useMemo(() => {
   // group[ЖК][система] = ZhkAgg
   const group: Record<string, Record<string, ZhkAgg>> = {};
   // Ключ строки — система + тип кампании (Поиск / YouTube / КМС / Лиды / Охват),
@@ -476,10 +514,6 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
     }
   }
 
-  const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", "Yandex Direct": "🟡", TikTok: "⚫" };
-  const cell = (c: (typeof ZHK_COLS)[number], a: ZhkAgg, isType: boolean) =>
-    "type" in c && c.type ? (isType ? domType(a.typeSpend) : "—") : (c as { get: (a: ZhkAgg) => number; fmt: (n: number) => string }).fmt((c as { get: (a: ZhkAgg) => number }).get(a));
-
   // Итог по каждому ЖК (для сортировки).
   const zhkTotal: Record<string, ZhkAgg> = {};
   for (const zhk of Object.keys(group)) {
@@ -487,6 +521,13 @@ function ZhkSummary({ metaCampaigns, metaAdsets, metaPeriod }: { metaCampaigns: 
     for (const a of Object.values(group[zhk])) { t.impressions += a.impressions; t.reach += a.reach; t.clicks += a.clicks; t.leads += a.leads; t.spend += a.spend; t.spendKzt += a.spendKzt; t.spendKztTax += a.spendKztTax; }
     zhkTotal[zhk] = t;
   }
+    return { group, zhkTotal };
+  }, [metaCampaigns, metaAdsets, google, googleAdgroups, yandex, tiktok, tiktokAdgroups, rate, taxRate, ak, nds]);
+
+  const SYS_ICON: Record<string, string> = { "Google Ads": "🔴", Meta: "🔵", "Yandex Direct": "🟡", TikTok: "⚫" };
+  const cell = (c: (typeof ZHK_COLS)[number], a: ZhkAgg, isType: boolean) =>
+    "type" in c && c.type ? (isType ? domType(a.typeSpend) : "—") : (c as { get: (a: ZhkAgg) => number; fmt: (n: number) => string }).fmt((c as { get: (a: ZhkAgg) => number }).get(a));
+
   const zhks = Object.keys(group).sort((x, y) => {
     const d = colVal(sortKey, zhkTotal[x]) - colVal(sortKey, zhkTotal[y]);
     return asc ? d : -d;
@@ -812,10 +853,10 @@ function GoogleAds({ metaPeriod }: { metaPeriod?: { start: string; end: string }
         </div>
         <ResponsiveContainer width="100%" height={340}>
           <LineChart data={chart} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
-            <CartesianGrid stroke="#263042" strokeDasharray="3 3" />
-            <XAxis dataKey="date" stroke="#8b95a7" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
-            <YAxis stroke="#8b95a7" fontSize={11} width={64} />
-            <Tooltip contentStyle={{ background: "#141925", border: "1px solid #263042", borderRadius: 10, color: "#e6e9ef" }} />
+            <CartesianGrid stroke="var(--chart-grid)" strokeDasharray="3 3" />
+            <XAxis dataKey="date" stroke="var(--muted)" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
+            <YAxis stroke="var(--muted)" fontSize={11} width={64} />
+            <Tooltip contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text)" }} />
             <Line type="monotone" dataKey="value" stroke="#34d399" strokeWidth={2} dot={false} name={METR.find((m) => m.k === metric)?.l} />
           </LineChart>
         </ResponsiveContainer>
@@ -1039,10 +1080,10 @@ function YandexAds() {
         </div>
         <ResponsiveContainer width="100%" height={340}>
           <LineChart data={chart} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
-            <CartesianGrid stroke="#263042" strokeDasharray="3 3" />
-            <XAxis dataKey="date" stroke="#8b95a7" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
-            <YAxis stroke="#8b95a7" fontSize={11} width={70} />
-            <Tooltip contentStyle={{ background: "#141925", border: "1px solid #263042", borderRadius: 10, color: "#e6e9ef" }} />
+            <CartesianGrid stroke="var(--chart-grid)" strokeDasharray="3 3" />
+            <XAxis dataKey="date" stroke="var(--muted)" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
+            <YAxis stroke="var(--muted)" fontSize={11} width={70} />
+            <Tooltip contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text)" }} />
             <Line type="monotone" dataKey="value" stroke="#facc15" strokeWidth={2} dot={false} name={METR.find((m) => m.k === metric)?.l} />
           </LineChart>
         </ResponsiveContainer>
@@ -1161,10 +1202,10 @@ function TiktokAds({ metaPeriod }: { metaPeriod?: { start: string; end: string }
         </div>
         <ResponsiveContainer width="100%" height={340}>
           <LineChart data={chart} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
-            <CartesianGrid stroke="#263042" strokeDasharray="3 3" />
-            <XAxis dataKey="date" stroke="#8b95a7" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
-            <YAxis stroke="#8b95a7" fontSize={11} width={70} />
-            <Tooltip contentStyle={{ background: "#141925", border: "1px solid #263042", borderRadius: 10, color: "#e6e9ef" }} />
+            <CartesianGrid stroke="var(--chart-grid)" strokeDasharray="3 3" />
+            <XAxis dataKey="date" stroke="var(--muted)" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
+            <YAxis stroke="var(--muted)" fontSize={11} width={70} />
+            <Tooltip contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text)" }} />
             <Line type="monotone" dataKey="value" stroke="#22d3ee" strokeWidth={2} dot={false} name={METR.find((m) => m.k === metric)?.l} />
           </LineChart>
         </ResponsiveContainer>
@@ -1498,7 +1539,7 @@ function FatigueTracker() {
 
           {insights.warn.length > 0 && (
             <div style={{ marginBottom: 12 }}>
-              <div style={{ fontWeight: 700, color: "#f59e0b", marginBottom: 6 }}>🟠 Стоит последить</div>
+              <div style={{ fontWeight: 700, color: "var(--warn)", marginBottom: 6 }}>🟠 Стоит последить</div>
               <ul style={{ margin: 0, paddingLeft: 20 }}>
                 {insights.warn.map(({ row, platform, flag }) => (
                   <li key={platform + row.id} style={{ marginBottom: 4 }}>
@@ -1787,6 +1828,19 @@ function MetaOfflinePanel() {
   );
 }
 
+// Корзины длительности цикла сделки (от первого обращения до договора).
+// На уровне модуля: константа статическая, внутри компонента она бы пересоздавалась.
+const CYCLE_BUCKETS = [
+  { key: "0", label: "В день обращения", test: (d: number) => d === 0 },
+  { key: "1-7", label: "1–7 дней", test: (d: number) => d >= 1 && d <= 7 },
+  { key: "8-14", label: "8–14 дней", test: (d: number) => d >= 8 && d <= 14 },
+  { key: "15-30", label: "15–30 дней", test: (d: number) => d >= 15 && d <= 30 },
+  { key: "31-60", label: "31–60 дней", test: (d: number) => d >= 31 && d <= 60 },
+  { key: "61-90", label: "61–90 дней", test: (d: number) => d >= 61 && d <= 90 },
+  { key: "91-180", label: "91–180 дней", test: (d: number) => d >= 91 && d <= 180 },
+  { key: "181+", label: "Более 180 дней", test: (d: number) => d >= 181 },
+] as const;
+
 function SalesReconcile() {
   // Несколько файлов на поле — так можно разбить огромную выгрузку (например, "лиды
   // с 2024 года") на части по году/периоду и не упереться в лимит памяти браузера
@@ -1804,9 +1858,14 @@ function SalesReconcile() {
   // По умолчанию считаем только квартиры — машиноместа/кладовки/офисы обычно не
   // интересуют для маркетинговой аналитики, но можно включить обратно.
   const [apartmentsOnly, setApartmentsOnly] = useState(true);
-  const contracts = allContracts && apartmentsOnly
-    ? allContracts.filter((c) => !c.propType || /кварт/i.test(c.propType))
-    : allContracts;
+  // Мемоизируем: .filter() возвращал бы новый массив на каждый рендер, а от ссылки
+  // на него зависит весь тяжёлый пересчёт сопоставления ниже.
+  const contracts = useMemo(
+    () => (allContracts && apartmentsOnly
+      ? allContracts.filter((c) => !c.propType || /кварт/i.test(c.propType))
+      : allContracts),
+    [allContracts, apartmentsOnly],
+  );
 
   // Сохранение накопленных данных в Turso: загружайте выгрузки постепенно (по кварталу/
   // полугодию), они копятся в базе с дедупликацией — а сверку потом можно делать по любому
@@ -2086,6 +2145,11 @@ function SalesReconcile() {
     setLoading(false);
   };
 
+  // Весь разбор ниже — это полный проход по выгрузке (десятки-сотни тысяч строк),
+  // поэтому он в useMemo: без него он повторялся на каждый ререндер компонента,
+  // включая переключение чекбокса «только без совпадения» или ввод даты в поля
+  // периода, которые к сопоставлению вообще никак не относятся.
+  const R = useMemo(() => {
   // phone → лид ПЕРВОГО касания: именно первый контакт привёл клиента, а последующие
   // обращения того же телефона — уже работа с существующим лидом.
   // Дату сравниваем как yyyymmdd: "05.06.2026" >= "12.01.2026" строкой даёт неверный порядок.
@@ -2288,16 +2352,6 @@ function SalesReconcile() {
   // ---- Когортный анализ: сколько дней проходит от первого обращения до договора ----
   // Когорта = месяц первого обращения (не месяц договора) — так видно, как быстро
   // "созревают" лиды именно этого месяца, а не сколько разных когорт закрылось в этом месяце.
-  const CYCLE_BUCKETS = [
-    { key: "0", label: "В день обращения", test: (d: number) => d === 0 },
-    { key: "1-7", label: "1–7 дней", test: (d: number) => d >= 1 && d <= 7 },
-    { key: "8-14", label: "8–14 дней", test: (d: number) => d >= 8 && d <= 14 },
-    { key: "15-30", label: "15–30 дней", test: (d: number) => d >= 15 && d <= 30 },
-    { key: "31-60", label: "31–60 дней", test: (d: number) => d >= 31 && d <= 60 },
-    { key: "61-90", label: "61–90 дней", test: (d: number) => d >= 61 && d <= 90 },
-    { key: "91-180", label: "91–180 дней", test: (d: number) => d >= 91 && d <= 180 },
-    { key: "181+", label: "Более 180 дней", test: (d: number) => d >= 181 },
-  ] as const;
   const toDate = (yyyymmdd: string) => new Date(+yyyymmdd.slice(0, 4), +yyyymmdd.slice(4, 6) - 1, +yyyymmdd.slice(6, 8));
   interface CohortRow { month: string; total: number; days: number[]; buckets: Record<string, number> }
   const cohorts: Record<string, CohortRow> = {};
@@ -2321,13 +2375,30 @@ function SalesReconcile() {
   const overallMedian = median(allCycleDays);
   const overallAvg = allCycleDays.length ? allCycleDays.reduce((a, b) => a + b, 0) / allCycleDays.length : 0;
 
-  const money = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
   const totalDeals = matched.length;
   const totalSum = matched.reduce((s, { contract }) => s + (/растор/i.test(contract.status) ? 0 : contract.sum), 0);
   const totalMatched = matched.filter((m) => m.lead).length;
   // Договоры без телефона ловятся только по ФИО — показываем, сколько их всего.
   const noPhone = matched.filter((m) => !m.contract.phones.length).length;
 
+    return {
+      leadByPhone, adLeadByPhone, adTotalMatched, matched, campaignOf,
+      matchedByPhone, matchedByName, matchedByAds, matchedLate,
+      reconRows, isTail, funnelRows, fTotal,
+      cohortRows, allCycleDays, median, overallMedian, overallAvg,
+      totalDeals, totalSum, totalMatched, noPhone,
+    };
+  }, [leads, contracts, adLeads, groupBy, adsByZhk]);
+
+  const {
+    leadByPhone, adLeadByPhone, adTotalMatched, matched, campaignOf,
+    matchedByPhone, matchedByName, matchedByAds, matchedLate,
+    reconRows, isTail, funnelRows, fTotal,
+    cohortRows, allCycleDays, median, overallMedian, overallAvg,
+    totalDeals, totalSum, totalMatched, noPhone,
+  } = R;
+
+  const money = (n: number) => Math.round(n).toLocaleString("ru-RU") + " ₸";
   const rowsToShow = unmatchedOnly ? matched.filter((m) => !m.lead) : matched;
 
   return (
@@ -2699,7 +2770,7 @@ function SalesReconcile() {
                         <td>{lead ? (lead.source || <span className="muted">не заполнен</span>) : <span className="muted">—</span>}</td>
                         <td>{lead?.date ?? "—"}</td>
                         <td>{by === "phone" ? "телефону"
-                          : by === "name" ? <span style={{ color: "#f59e0b" }}>ФИО</span>
+                          : by === "name" ? <span style={{ color: "var(--warn)" }}>ФИО</span>
                           : by === "ads" ? <span style={{ color: "var(--good)" }}>кабинету</span>
                           : by === "late" ? <span className="muted" title="Клиент обращался, но уже после подписания договора">лид после сделки</span>
                           : <span className="muted">—</span>}</td>
@@ -2729,8 +2800,8 @@ function SalesReconcile() {
 /* ============ Медиаплан: CPL/качество по ЖК × площадка, рекомендация по бюджету ============ */
 const RECOMMEND_COLOR: Record<string, string> = {
   "Поднять бюджет (+20%)": "var(--good)",
-  "Снизить бюджет (−30%)": "#f59e0b",
-  "Рассмотреть отключение": "var(--bad, #f87171)",
+  "Снизить бюджет (−30%)": "var(--warn)",
+  "Рассмотреть отключение": "var(--bad)",
   "Оставить как есть": "var(--muted)",
   "Недостаточно данных": "var(--muted)",
 };
@@ -2829,7 +2900,7 @@ function MediaPlanTab() {
                     <td>{r.cpl ? money(r.cpl) : "—"}</td>
                     <td>{r.qual || "—"}</td>
                     <td>{r.leads ? (r.crQual * 100).toFixed(1) + "%" : "—"}</td>
-                    <td style={r.unprocessedPct >= 0.3 ? { color: "#f59e0b" } : undefined}>
+                    <td style={r.unprocessedPct >= 0.3 ? { color: "var(--warn)" } : undefined}>
                       {r.leads ? (r.unprocessedPct * 100).toFixed(0) + "%" : "—"}
                     </td>
                     <td>{r.benchmarkCpl ? money(r.benchmarkCpl) : "—"}</td>
@@ -3033,11 +3104,11 @@ function Dynamics({ daily }: { daily: DailyRow[] }) {
       ) : (
         <ResponsiveContainer width="100%" height={440}>
           <LineChart data={chartData} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
-            <CartesianGrid stroke="#263042" strokeDasharray="3 3" />
-            <XAxis dataKey="date" stroke="#8b95a7" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
+            <CartesianGrid stroke="var(--chart-grid)" strokeDasharray="3 3" />
+            <XAxis dataKey="date" stroke="var(--muted)" fontSize={11} interval="preserveStartEnd" minTickGap={24} />
             {selected.map((k) => <YAxis key={k} yAxisId={k} hide domain={["auto", "auto"]} />)}
             <Tooltip
-              contentStyle={{ background: "#141925", border: "1px solid #263042", borderRadius: 10, color: "#e6e9ef" }}
+              contentStyle={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 10, color: "var(--text)" }}
               formatter={(v: number, name: string) => [formatMetric(name, v), METRIC_BY_KEY[name]?.label ?? name]}
             />
             <Legend formatter={(v) => METRIC_BY_KEY[v]?.label ?? v} />

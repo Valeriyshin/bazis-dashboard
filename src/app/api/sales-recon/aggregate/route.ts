@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDb, rowsToObjects } from "@/lib/db";
+import { getDb, rowsToObjects, ensureReconSchema } from "@/lib/db";
 import {
   buildReconciliation, buildAdsByZhk,
   type LeadRow, type ContractRow, type AdLeadRow, type GroupKey,
@@ -42,11 +42,7 @@ export async function GET(req: NextRequest) {
     const groupBy = (req.nextUrl.searchParams.get("groupBy") || "source") as GroupKey;
     const apartmentsOnly = req.nextUrl.searchParams.get("apartmentsOnly") !== "0";
 
-    const db = getDb();
-    await db.execute(`CREATE TABLE IF NOT EXISTS sales_recon_rows (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, dedup_key TEXT NOT NULL,
-      phone TEXT, date_iso TEXT, data TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(kind, dedup_key)
-    )`);
+    await ensureReconSchema();
 
     const [leadsRaw, contractsRaw, adLeadsRaw] = await Promise.all([
       fetchAllRows("lead", since, until),

@@ -1,20 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createHash } from "node:crypto";
-import { getDb, rowsToObjects } from "@/lib/db";
+import { getDb, rowsToObjects, ensureReconSchema } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
-
-const SCHEMA = `CREATE TABLE IF NOT EXISTS sales_recon_rows (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL,
-  dedup_key TEXT NOT NULL,
-  phone TEXT,
-  date_iso TEXT,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE(kind, dedup_key)
-)`;
 
 type Kind = "lead" | "contract" | "adlead";
 
@@ -51,7 +40,7 @@ function phoneOf(kind: Kind, row: Record<string, unknown>): string {
 export async function POST(req: NextRequest) {
   try {
     const db = getDb();
-    await db.execute(SCHEMA);
+    await ensureReconSchema();
     const body = await req.json();
     const kind = body.kind as Kind;
     const rows = body.rows as Record<string, unknown>[];
@@ -79,7 +68,7 @@ export async function POST(req: NextRequest) {
 export async function GET(req: NextRequest) {
   try {
     const db = getDb();
-    await db.execute(SCHEMA);
+    await ensureReconSchema();
     const kinds = (req.nextUrl.searchParams.get("kind") || "lead,contract,adlead").split(",");
     const since = req.nextUrl.searchParams.get("since") || "";
     const until = req.nextUrl.searchParams.get("until") || "";

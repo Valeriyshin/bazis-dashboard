@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDb, rowsToObjects } from "@/lib/db";
+import { getDb, rowsToObjects, ensureReconSchema } from "@/lib/db";
 import { buildMediaPlan, type LeadRow } from "@/lib/salesRecon";
 
 // Медиаплан: CPL/качество лидов по (ЖК × площадка) за период + рекомендация по бюджету.
@@ -36,11 +36,7 @@ export async function GET(req: NextRequest) {
     const since = req.nextUrl.searchParams.get("since") || "";
     const until = req.nextUrl.searchParams.get("until") || "";
 
-    const db = getDb();
-    await db.execute(`CREATE TABLE IF NOT EXISTS sales_recon_rows (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, dedup_key TEXT NOT NULL,
-      phone TEXT, date_iso TEXT, data TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(kind, dedup_key)
-    )`);
+    await ensureReconSchema();
 
     const [leads, meta, google, tiktok, yandex] = await Promise.all([
       fetchLeads(since, until),
